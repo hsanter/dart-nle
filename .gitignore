@@ -11,6 +11,10 @@
 Gemfile.lock
 _site/
 .cppdefs
+**/set_def.out
+**/obs_seq.out
+**/obs_seq.in
+**/obs_seq.final
 
 # Nuisance files
 

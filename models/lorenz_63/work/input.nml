@@ -94,6 +94,7 @@
 
 &assim_tools_nml
    cutoff                          = 1000000.0
+   filter_kind                     = 9,
    sort_obs_inc                    = .false.,
    spread_restoration              = .false.,
    sampling_error_correction       = .false.,
