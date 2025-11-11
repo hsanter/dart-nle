@@ -201,6 +201,7 @@ done
 # remove nuisance files
 nuisance=(\
 "$DART/assimilation_code/modules/assimilation/assim_tools_mod.pf.f90"
+"$DART/assimilation_code/modules/assimilation/assim_tools_mod.nopf.f90"
 "$DART/assimilation_code/modules/assimilation/filter_mod.dopplerfold.f90"
 "$DART/assimilation_code/modules/utilities/null_restart_pnetcdf_mod.f90"
 "$DART/assimilation_code/modules/utilities/pnetcdf_utilities_mod.f90"
