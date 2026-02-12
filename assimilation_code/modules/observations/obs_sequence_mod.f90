@@ -17,11 +17,11 @@ module obs_sequence_mod
 ! of the type are not private. Second, if I inherit assignment(=) from obs_def
 ! and also define one in obs_sequence, I get an error if I try to make it public
 ! to a module that uses obs_sequence but not obs_def with the intel compiler. No
-! obvious workaround exists. For now, make modules at higher levels use explicit
+! obvious workaround exists. For now, make modules at higher levels use explici
 ! copy subroutines. USERS MUST BE VERY CAREFUL TO NOT DO DEFAULT ASSIGNMENT
 ! FOR THESE TYPES THAT HAVE COPY SUBROUTINES.
 
-use        types_mod, only : r8, i8, MISSING_R8, metadatalength
+use        types_mod, only : r8, i8, MISSING_R8, metadatalength, obstypelength
 
 use     location_mod, only : location_type, is_location_in_region
 
@@ -29,7 +29,9 @@ use      obs_def_mod, only : obs_def_type, get_obs_def_time, read_obs_def, &
                              write_obs_def, destroy_obs_def, copy_obs_def, &
                              interactive_obs_def, get_obs_def_location, &
                              get_obs_def_type_of_obs, get_obs_def_key,  &
-                             operator(==), operator(/=), print_obs_def
+                             operator(==), operator(/=), print_obs_def, &
+                             set_obs_def_error_variance, &
+                             get_obs_def_error_variance
 
 use     obs_kind_mod, only : write_type_of_obs_table, &
                              read_type_of_obs_table, &
@@ -75,7 +77,7 @@ public :: obs_sequence_type, init_obs_sequence, interactive_obs_sequence, &
    delete_seq_head, delete_seq_tail, &
    get_next_obs_from_key, get_prev_obs_from_key, delete_obs_by_typelist, &
    select_obs_by_location, delete_obs_by_qc, delete_obs_by_copy, &
-   print_obs_seq_summary, validate_obs_seq_time
+   print_obs_seq_summary, validate_obs_seq_time, update_obs_seq_variances
 
 ! Public interfaces for obs
 public :: obs_type, init_obs, destroy_obs, get_obs_def, set_obs_def, &
@@ -85,6 +87,15 @@ public :: obs_type, init_obs, destroy_obs, get_obs_def, set_obs_def, &
 
 ! Public interfaces for obs covariance modeling
 public :: obs_cov_type
+
+! Public interfaces for obs subsetting
+public :: set_obs_subset_type, &
+     obs_subset_def_type, set_obs_subset_bounds, read_obs_subset_defs, &
+     read_obs_subset_def_count, get_obs_time_range_subset, &
+     get_obs_subset_variance, set_obs_subset_variance, &
+     get_subset_info_from_seq, get_obs_subset_num, set_cov_group, &
+     get_obs_subset_bounds, get_obs_subset_type, obs_subset_type, &
+     get_obs_subset_def_num
 
 character(len=*), parameter :: source = 'obs_sequence_mod.f90'
 
@@ -123,6 +134,20 @@ type obs_cov_type
    private
    integer :: num_cov_groups
 end type obs_cov_type
+
+type obs_subset_def_type
+   private
+   real(r8) :: min_box
+   real(r8) :: max_box
+   character(len=obstypelength) :: obs_type(1)
+   integer :: group_num
+end type obs_subset_def_type
+
+type obs_subset_type
+   private
+   real(r8) :: error_variance
+   integer :: group_num
+end type obs_subset_type
 
 ! for errors
 character(len=512) :: string1, string2, string3
@@ -623,25 +648,50 @@ end subroutine get_obs_time_range
 
 !---------------------------------------------------------------
 
-subroutine get_time_range_keys(seq, key_bounds, num_keys, keys)
+
+subroutine get_time_range_keys(seq, key_bounds, num_keys, keys, subset, dart_qc_index)
 
 ! Given bounds from get_obs_time_range and an array keys big enough to hold
 ! all the keys in the range, returns the keys in the range
 
+! optional argument subset to only return keys within a given subset
+! (assumes get_obs_time_range_subset was previously called)
+
 type(obs_sequence_type), intent(in)  :: seq
 integer,                 intent(in)  :: key_bounds(2), num_keys
 integer,                 intent(out) :: keys(num_keys)
+type(obs_subset_type), intent(in), optional :: subset
+integer,                 intent(in), optional :: dart_qc_index
 
-integer :: current, i
+integer :: current, i, target_group_num = -888, curr_group_num
+real(r8) :: dart_qc(1)
+
+if(present(subset)) then
+   target_group_num = subset%group_num
 
 ! Now loop through again to get these keys
-current = key_bounds(1)
-do i = 1, num_keys
-   keys(i) = seq%obs(current)%key
-   current = seq%obs(current)%next_time
-end do
+   current = key_bounds(1)
+   i = 1
+   do while(i <= num_keys)
+      curr_group_num = get_cov_group(seq%obs(current))
+      if(curr_group_num == target_group_num) then
+         keys(i) = seq%obs(current)%key
+         i = i + 1
+      endif
+      current = seq%obs(current)%next_time
+   end do
+
+else
+   
+   current = key_bounds(1)
+   do i = 1, num_keys
+      keys(i) = seq%obs(current)%key
+      current = seq%obs(current)%next_time
+   end do
+endif
 
 end subroutine get_time_range_keys
+
 
 
 !-------------------------------------------------
@@ -3006,6 +3056,369 @@ endif
 
 end subroutine validate_obs_seq_time
 
+
+function get_cov_group(obs)
+
+type(obs_type),     intent(in)  :: obs
+integer :: get_cov_group
+
+get_cov_group = obs%cov_group
+end function get_cov_group
+
+subroutine set_cov_group(obs, cov_group)
+
+type(obs_type),     intent(inout)  :: obs
+integer, intent(in) :: cov_group
+
+obs%cov_group = cov_group
+end subroutine set_cov_group
+
+function get_obs_subset_variance(subset)
+
+type(obs_subset_type),     intent(in)  :: subset
+real(r8) :: get_obs_subset_variance
+
+get_obs_subset_variance = subset%error_variance
+end function get_obs_subset_variance
+
+function get_obs_subset_def_num(subset)
+
+type(obs_subset_def_type),     intent(in)  :: subset
+real(r8) :: get_obs_subset_def_num
+
+get_obs_subset_def_num = subset%group_num
+
+end function get_obs_subset_def_num
+
+
+function get_obs_subset_num(subset)
+
+type(obs_subset_type),     intent(in)  :: subset
+real(r8) :: get_obs_subset_num
+
+get_obs_subset_num = subset%group_num
+
+end function get_obs_subset_num
+
+subroutine set_obs_subset_variance(subset, variance)
+
+type(obs_subset_type),     intent(inout)  :: subset
+real(r8), intent(in) :: variance
+
+subset%error_variance = variance
+end subroutine set_obs_subset_variance
+
+subroutine set_obs_subset_bounds(obs_subset, min, max)
+
+real(r8), intent(in)  :: min
+real(r8), intent(in)  :: max
+type(obs_subset_def_type), intent(out) :: obs_subset
+
+obs_subset%min_box = min
+obs_subset%max_box = max
+
+end subroutine set_obs_subset_bounds
+
+subroutine set_obs_subset_group(obs_subset, group_num)
+
+integer, intent(in) :: group_num
+type(obs_subset_def_type), intent(out) :: obs_subset
+
+obs_subset%group_num = group_num
+
+end subroutine set_obs_subset_group
+
+subroutine set_obs_subset_type(obs_subset, type_string)
+
+  character(len=*), intent(in) :: type_string(1)
+type(obs_subset_def_type), intent(out) :: obs_subset
+
+obs_subset%obs_type = type_string
+
+end subroutine set_obs_subset_type
+
+subroutine get_obs_subset_type(obs_subset, type_string)
+
+character(len=*), intent(out) :: type_string(1)
+type(obs_subset_def_type), intent(in) :: obs_subset
+
+type_string = obs_subset%obs_type
+
+end subroutine get_obs_subset_type
+
+subroutine get_obs_subset_bounds(obs_subset, min, max)
+
+type(obs_subset_def_type), intent(in) :: obs_subset
+real(r8), intent(out) :: min, max
+
+min = obs_subset%min_box
+max = obs_subset%max_box
+
+end subroutine get_obs_subset_bounds
+
+
+subroutine read_obs_subset_def_count(num_subsets, file_name, file_id, close_the_file)
+
+character(len=*),  intent(in)  :: file_name
+integer,           intent(out) :: num_subsets, file_id
+logical, optional, intent(in)  :: close_the_file
+
+character(len=200) :: line
+character(len=6) :: subset_str
+integer :: ios
+
+num_subsets = 0
+subset_str = 'SUBSET'
+
+file_id = open_file(file_name, action='read')
+
+! this feels like it's not the best way to read this
+! info in from the file. ask helen/jeff about this.
+do
+   read(file_id, *, iostat = ios) line
+   if(ios /= 0) then
+      exit
+   else
+      if(line(1:6) == subset_str) then
+         num_subsets = num_subsets + 1
+      endif
+   endif
+enddo
+
+if(present(close_the_file)) then
+   if(close_the_file) call close_file(file_id)
+endif
+
+end subroutine read_obs_subset_def_count
+
+! currently only works for differentiating 1d observations according to
+! location and type - ideally will be generalized for reading arbitrary metadata.
+subroutine read_obs_subset_defs(subset_defs, num_subsets, file_name, file_id, close_the_file)
+
+character(len=*),          intent(in)  :: file_name
+integer,                   intent(in)  :: num_subsets
+type(obs_subset_def_type), intent(out) :: subset_defs(num_subsets)
+logical, optional,         intent(in)  :: close_the_file
+integer,                   intent(out) :: file_id
+
+integer                                :: i, ios, group_num
+character(len=200)                     :: line
+real(r8)                               :: min, max, variance
+character(len=obstypelength)           :: type
+
+file_id = open_file(file_name, action='read')
+read(file_id, *, iostat = ios) line
+
+! this feels like it's not the best way to read this
+! info in from the file. ask helen/jeff about this.
+do i = 1,num_subsets
+   read(file_id, *, iostat = ios) line
+   read(file_id, *, iostat = ios) group_num
+   read(file_id, *, iostat = ios) line 
+   read(file_id, *, iostat = ios) min
+   read(file_id, *, iostat = ios) line
+   read(file_id, *, iostat = ios) max
+   read(file_id, *, iostat = ios) line
+   read(file_id, *, iostat = ios) type
+
+   call set_obs_subset_bounds(subset_defs(i), min, max) 
+   call set_obs_subset_type(subset_defs(i), type) 
+   call set_obs_subset_group(subset_defs(i), group_num) 
+   
+enddo
+
+end subroutine read_obs_subset_defs
+
+! retreives key range for all obs within a certain time window, within a certain subset
+! wasn't sure if it made more sense to build this into the vanilla
+! get_obs_time_range with an optional argument or to have this as its own function -
+! much of the code is the same.
+subroutine get_obs_time_range_subset(seq, time1, time2, key_bounds, num_keys, out_of_range, subset, dart_qc_index, obs)
+
+! Add other options for getting the first time to minimize search
+type(obs_sequence_type), intent(in)           :: seq
+type(time_type),         intent(in)           :: time1, time2
+integer,                 intent(out)          :: key_bounds(2)
+integer,                 intent(out)          :: num_keys
+logical,                 intent(out)          :: out_of_range
+type(obs_subset_type),   intent(in)               :: subset
+type(obs_type),          intent(in), optional :: obs
+integer,                 intent(in), optional          :: dart_qc_index
+
+type(time_type)                                 :: cur_time
+type(obs_def_type)                            :: obs_def
+integer                                        :: current, last_key, target_group_num, curr_group_num
+real(r8)                                        :: qc(1)
+
+
+! Returns the first key and last key of sequence of obs between time1 and
+! time2 along with the total number.
+! A complete list of the keys can be obtained by call to get_time_range_keys
+! Logical out_of_range is true if the time range is all past the end of sequence times
+
+num_keys = 0
+out_of_range = .false.
+
+target_group_num = subset%group_num
+
+! The optional argument obs says the search can be started at this observation
+
+! Figure out where to begin search
+if(present(obs)) then
+   current = obs%key
+else
+   current = seq%first_time
+endif
+
+! Check for all observations after the last time in the window
+call get_obs_def(seq%obs(current), obs_def)
+cur_time = get_obs_def_time(obs_def)
+if(cur_time > time2) then
+   out_of_range = .true.
+   return
+endif
+
+! Find the first element in the time window
+do while(current /= -1)
+   call get_obs_def(seq%obs(current), obs_def)
+   
+   cur_time = get_obs_def_time(obs_def)
+   curr_group_num = get_cov_group(seq%obs(current))
+   
+   if(cur_time >= time1 .and. curr_group_num == target_group_num) goto 10
+   current = seq%obs(current)%next_time
+end do
+! Falling off the end means there are no times greater than time1
+out_of_range = .true.
+return
+
+10 continue
+! current is pointer to first
+
+! First pass, count the keys for storage requirements
+key_bounds(1) = current
+last_key = current
+do while(current /= -1)
+   call get_obs_def(seq%obs(current), obs_def)
+   cur_time = get_obs_def_time(obs_def)
+   curr_group_num = get_cov_group(seq%obs(current))
+   if(cur_time > time2) goto 20
+! Found a time in the range
+   if(curr_group_num == target_group_num) then
+      num_keys = num_keys + 1
+   endif
+   last_key = current
+!!$      print *, last_key
+   current = seq%obs(current)%next_time
+end do
+
+20 continue
+key_bounds(2) = last_key
+
+end subroutine get_obs_time_range_subset
+
+
+!-------------------------------------------------------------------------
+
+! updates obs the rest of the obs sequence from the given start key to the end
+! with new obs error variances
+subroutine update_obs_seq_variances(seq, obs_subset_variances, num_subsets, start_time, posterior)
+
+integer,                 intent(in)    :: num_subsets, start_time
+type(obs_sequence_type), intent(inout) :: seq
+real(r8),                intent(in)    :: obs_subset_variances(:)
+logical,                 intent(in)    :: posterior
+
+type(obs_type)     :: obs
+type(obs_def_type) :: obs_def
+integer            :: i, current, group_num
+
+! if we're doing this post assimilation, start updating
+! the obs sequence with the obs after the current cycle
+if(posterior) then
+
+   current = seq%obs(start_time)%next_time
+else
+   current = start_time
+end if
+
+do while(current /= -1)
+   obs = seq%obs(current)
+   group_num = get_cov_group(obs)
+
+   if(group_num == -1) then
+      current = seq%obs(current)%next_time
+      cycle
+   endif
+
+   call get_obs_def(obs, obs_def)
+   call set_obs_def_error_variance(obs_def, &
+        obs_subset_variances(group_num))
+   call copy_obs_def(obs%def, obs_def)
+   call get_obs_def(obs, obs_def)
+   seq%obs(current) = obs
+   current = seq%obs(current)%next_time
+end do
+
+
+
+end subroutine update_obs_seq_variances
+
+! reads through obs sequence and identifies the distinct
+! (cov group, initial variance) pairs. note that this assumes
+! that obs in the same cov group are modeled as all having
+! the same error variance
+subroutine get_subset_info_from_seq(seq, num_subsets, subsets)
+
+  type(obs_sequence_type),                 intent(inout) :: seq
+  integer,                                 intent(out)   :: num_subsets
+  type(obs_subset_type),  allocatable, intent(out)   :: subsets(:)
+
+  integer              :: i, count, group_num
+  integer              :: max_group_num = -1
+  type(obs_type)       :: obs
+  logical, allocatable :: found_subsets(:)
+
+  num_subsets = 0
+  count = 0
+
+  do i=1, seq%num_obs 
+     obs = seq%obs(i)
+     if (obs%cov_group > max_group_num) then
+        max_group_num = obs%cov_group
+     end if
+  end do
+
+  num_subsets = max_group_num
+  max_group_num = -1
+  count = 0
+
+  allocate(subsets(num_subsets))
+!!$  allocate(variances(num_subsets))
+  allocate(found_subsets(num_subsets))
+
+  found_subsets = .false.
+
+  do i=1, seq%num_obs 
+     obs = seq%obs(i)
+     group_num = obs%cov_group
+
+     if (.not. found_subsets(group_num)) then
+        found_subsets(group_num) = .true.
+        count = count + 1
+        subsets(group_num)%error_variance = get_obs_def_error_variance(obs%def)
+        subsets(group_num)%group_num = group_num
+        if(count == num_subsets) then
+           return
+        end if
+        
+     end if
+  end do
+
+  deallocate(found_subsets)
+
+
+end subroutine get_subset_info_from_seq
 
 
 !-------------------------------------------------

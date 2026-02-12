@@ -18,15 +18,27 @@ use obs_sequence_mod,      only : read_obs_seq, obs_type, obs_sequence_type,    
                                   set_qc_meta_data, get_first_obs, get_obs_time_range,        &
                                   delete_obs_from_seq, delete_seq_head,                       &
                                   delete_seq_tail, replace_obs_values, replace_qc,            &
-                                  destroy_obs_sequence, get_qc_meta_data, add_qc
+                                  destroy_obs_sequence, get_qc_meta_data, add_qc,             &
+                                  set_obs_subset_type, obs_subset_def_type,                   &
+                                  read_obs_subset_defs, read_obs_subset_def_count,            &
+                                  get_obs_time_range_subset,                                  &
+                                  get_obs_subset_variance, update_obs_seq_variances,          &
+                                  get_subset_info_from_seq, obs_subset_type
                                  
 use obs_def_mod,           only : obs_def_type, get_obs_def_error_variance, get_obs_def_time, &
                                   get_obs_def_type_of_obs
 
+
+use obs_estimation_mod,    only:  obs_estimation_init, update_subset_variances_postassim,   &
+                                  update_subset_variances_preassim, do_variance_estimation, &
+                                  use_variance_estimates, do_prior_obs_estimation,          &
+                                  do_posterior_obs_estimation, obs_estimation_type,         &
+                                  get_subset_variances, set_subset_variances
+
 use obs_def_utilities_mod, only : set_debug_fwd_op
 
 use time_manager_mod,      only : time_type, get_time, set_time, operator(/=), operator(>),   &
-                                  operator(-), print_time
+                                  operator(-), print_time, operator(/), operator(+)
 
 use utilities_mod,         only : error_handler, E_ERR, E_MSG, E_DBG,                         &
                                   logfileunit, nmlfileunit, timestamp,                        &
@@ -35,7 +47,8 @@ use utilities_mod,         only : error_handler, E_ERR, E_MSG, E_DBG,           
                                   set_multiple_filename_lists, find_textfile_dims
 
 use assim_model_mod,       only : static_init_assim_model, get_model_size,                    &
-                                  end_assim_model,  pert_model_copies, get_state_meta_data
+                                  end_assim_model,  pert_model_copies, get_state_meta_data,   &
+                                  get_model_time_step
 
 use assim_tools_mod,       only : filter_assim, set_assim_tools_trace, test_state_copies
 use obs_model_mod,         only : move_ahead, advance_state, set_obs_model_trace
@@ -326,10 +339,16 @@ type(ensemble_type)         :: state_ens_handle, obs_fwd_op_ens_handle, qc_ens_h
 type(obs_sequence_type)     :: seq
 type(time_type)             :: time1, first_obs_time, last_obs_time
 type(time_type)             :: curr_ens_time, next_ens_time, window_time
+type(time_type)             :: estimation_window_start
+type(time_type)             :: estimation_window_end
+type(obs_estimation_type)  :: estimation_handle
+type(obs_subset_type), allocatable :: obs_subset_defs(:)
 
 integer,    allocatable :: keys(:)
 integer(i8)             :: model_size
 integer                 :: iunit, io, time_step_number, num_obs_in_set, ntimes
+integer                 :: num_subsets, num_obs_in_subset
+integer                 :: subset_file_id
 integer                 :: last_key_used, key_bounds(2)
 integer                 :: in_obs_copy, obs_val_index
 integer                 :: prior_obs_mean_index, posterior_obs_mean_index
@@ -341,6 +360,7 @@ integer                 :: OBS_MEAN_START, OBS_MEAN_END
 integer                 :: OBS_VAR_START, OBS_VAR_END, TOTAL_OBS_COPIES
 integer                 :: input_qc_index, DART_qc_index
 integer                 :: num_state_ens_copies
+integer                 :: i, j
 logical                 :: read_time_from_file
 
 integer :: num_extras ! the extra ensemble copies
@@ -634,6 +654,20 @@ endif
 
 call trace_message('After  trimming obs seq if start/stop time specified')
 
+
+! retrieve obs variance groups and their corresponding initial variances
+! from this obs sequence
+call get_subset_info_from_seq(seq, num_subsets, obs_subset_defs)
+
+
+! set up handle where information about estimating obs variance is stored
+! and load subset information from sequence into it
+call obs_estimation_init(estimation_handle, prior_obs_mean_index, posterior_obs_mean_index, &
+     prior_obs_spread_index, obs_val_index, DART_qc_index, ens_size, obs_subset_defs, num_subsets)
+
+call timestamp_message('After  initializing obs estimation')
+call     trace_message('After  initializing obs estimation')
+
 ! Time step number is used to do periodic diagnostic output
 time_step_number = -1
 curr_ens_time = set_time(0, 0)
@@ -887,6 +921,34 @@ AdvanceTime : do
            OBS_VAL_COPY, OBS_ERR_VAR_COPY, DART_qc_index, compute_posterior)
    call trace_message('After  observation space diagnostics')
 
+   ! use obs space diagnostics to estimate observation error variances for any
+   ! specified groups of observations
+   ! HMS - in the future, it may be a good idea to consolidate obs error variance
+   ! estimation code into obs_space_diagnostics so all of the gathering/broadcasting
+   ! for observation space stuff happens in one place/time.
+
+   if(do_prior_obs_estimation(estimation_handle)) then
+      call trace_message('Before updating subset variances - pre assimilation')
+
+      estimation_window_end = curr_ens_time + get_model_time_step()/2
+
+      ! where the magic happens
+      if(my_task_id() == 0) then
+         call update_subset_variances_preassim(estimation_handle, obs_subset_defs, num_subsets, &
+              estimation_window_end, seq)
+      endif
+
+      ! push estimated variances out to all the other tasks
+      ! and update the obs sequence accordingly for use the next time we assimilate
+      if(use_variance_estimates(estimation_handle)) then
+         call filter_sync_subset_variances(estimation_handle)
+         call update_obs_seq_variances(seq, get_subset_variances(estimation_handle), num_subsets, key_bounds(1), posterior = .false.)
+      endif
+
+      call trace_message('After updating subset variances - pre assimilation')
+
+   endif
+
 
    write(msgstring, '(A,I8,A)') 'Ready to assimilate up to', size(keys), ' observations'
    call trace_message(msgstring, 'filter:', -1)
@@ -1008,6 +1070,30 @@ AdvanceTime : do
       call deallocate_single_copy(obs_fwd_op_ens_handle, prior_qc_copy)
    endif
 
+
+   ! use obs space diagnostics to estimate observation variances for any
+   ! specified groups of observations
+   if(do_posterior_obs_estimation(estimation_handle)) then
+      call trace_message('Before updating subset variances - postassim')
+
+      estimation_window_end = curr_ens_time + get_model_time_step()/2
+   
+      ! where the magic happens
+      if(my_task_id() == 0) then
+         call update_subset_variances_postassim(estimation_handle, obs_subset_defs, num_subsets, &
+              estimation_window_end, seq)
+      endif
+
+      ! push estimated variances out to all the other tasks
+      ! and update the obs sequence accordingly for use the next time we assimilate
+      if(use_variance_estimates(estimation_handle)) then
+         call filter_sync_subset_variances(estimation_handle)
+         call update_obs_seq_variances(seq, get_subset_variances(estimation_handle), num_subsets, key_bounds(2), posterior=.true.)
+      endif
+   
+      call trace_message('After  updating subset variances - postassim')
+   endif
+
    ! this block computes the adaptive state space posterior inflation
    ! (it was applied earlier, this is computing the updated values for
    ! the next cycle.)
@@ -1089,6 +1175,22 @@ AdvanceTime : do
 end do AdvanceTime
 
 call trace_message('End of main filter assimilation loop, starting cleanup', 'filter:', -1)
+
+
+if(do_variance_estimation(estimation_handle)) then
+
+   ! for testing only, printing final estimated variances to
+   ! confirm that some estimation was done, and see what it gave us
+   if(my_task_id() == 0) then
+      do i = 1, num_subsets
+         print *, get_obs_subset_variance(obs_subset_defs(i))
+         write(logfileunit,*) get_obs_subset_variance(obs_subset_defs(i))
+      enddo
+   endif
+
+   deallocate(obs_subset_defs)
+
+endif
 
 ! Output the adjusted ensemble. If cycling only the last timestep is writen out
 if (get_stage_to_write('output')) then
@@ -1821,6 +1923,29 @@ endif
 ens_handle%current_time = time1
 
 end subroutine filter_sync_keys_time
+
+
+subroutine filter_sync_subset_variances(estimation_handle)
+  
+type(obs_estimation_type), intent(inout) :: estimation_handle
+
+integer :: array_dim
+real(r8), allocatable                                :: variances(:)
+
+array_dim = size(get_subset_variances(estimation_handle))
+allocate(variances(array_dim))
+variances = get_subset_variances(estimation_handle)
+
+if(my_task_id() == 0) then
+   call broadcast_send(my_task_id(), variances)
+else                                
+   call broadcast_recv(0, variances)
+   call set_subset_variances(estimation_handle, variances)
+endif
+
+deallocate(variances)
+   
+end subroutine filter_sync_subset_variances
 
 !-------------------------------------------------------------------------
 ! Only copy 1 on task zero has the correct time after reading

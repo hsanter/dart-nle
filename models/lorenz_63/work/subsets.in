@@ -1,0 +1,11 @@
+obs_subset_defs
+
+SUBSET
+1
+min_box
+0.0
+max_box
+1.0
+type
+RAW_STATE_VARIABLE
+

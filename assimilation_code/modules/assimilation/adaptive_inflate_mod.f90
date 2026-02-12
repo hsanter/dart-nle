@@ -32,7 +32,8 @@ public :: update_inflation,                                 do_obs_inflate,     
           get_inflation_sd_copy,    do_rtps_inflate,        validate_inflate_options, &
           print_inflation_restart_filename,                                           &
           PRIOR_INF, POSTERIOR_INF, NO_INFLATION, OBS_INFLATION, VARYING_SS_INFLATION, &
-          SINGLE_SS_INFLATION, RELAXATION_TO_PRIOR_SPREAD, ENHANCED_SS_INFLATION
+          SINGLE_SS_INFLATION, RELAXATION_TO_PRIOR_SPREAD, ENHANCED_SS_INFLATION,     &
+          change_GA_IG
 
 character(len=*), parameter :: source = 'adaptive_inflate_mod.f90'
 
