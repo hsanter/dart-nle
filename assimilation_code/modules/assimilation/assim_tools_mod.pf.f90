@@ -754,13 +754,13 @@ ITERATIONS: do iter = 1,maxiter
 
           ! Likelihood calculations
           orig_obs_prior = obs_ens_init(1:ens_size, owners_index)
-          d = (obs(1) - orig_obs_prior)**2 / (2.0_r8*obs_err_var)
-          d = d - minval(d)
+          d = (obs(1) - orig_obs_prior)**2 / (2.0_r8*obs_err_var) ! actual (part of) likelihood
+          d = d - minval(d) ! helps w round off
 
-          ! Determine whether to skip ob
-          hw = exp( -d )
+          hw = exp( -d ) ! this is where im gonna slot my stuff in
           hw = hw / sum(hw)
 
+          ! Determine whether to skip ob
           if (1.0_r8 > ens_size * 0.98_r8 *sum(hw**2) ) then
             ! write(*,*) 'Skipping with Neff =',1.0_r8 / sum(hw**2)
             obs_qc = 1
