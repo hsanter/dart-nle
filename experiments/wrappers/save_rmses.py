@@ -17,7 +17,6 @@ try:
     nc = xr.open_dataset(in_path)
 except FileNotFoundError:
     print(in_path + " not found - presumably experiment failed")
-method_ind = int(in_path[-4]) - 1
 
 metadata_order = nc['CopyMetaData'].to_numpy().astype(str)
 find_index = np.char.find(metadata_order, val)

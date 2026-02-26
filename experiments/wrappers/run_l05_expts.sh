@@ -42,7 +42,7 @@ echo " "
 
 # Paths to data and DART components
 export dartp=/Users/santer/dart-nle
-export modp=${dartp}/models/lorenz_63/work
+export modp=${dartp}/models/lorenz_04/work
 export datap=${dartp}/experiments/setup
 export shellp=${dartp}/experiments/wrappers
 export plotcp=${dartp}/experiments/plotting
@@ -54,8 +54,8 @@ export plotcp=${dartp}/experiments/plotting
 #    cutoff_range         <-- localization length scale
 #    NL_FRAC_NEFF         <-- ensemble size fraction used for regularization (PF)
 
-ens_range=( 80 )
-obs_est_flavor_range=( 0 1 2 3 )
+ens_range=( 100 )
+obs_est_flavor_range=( 2 3 )
 # 0: unchanged obs errors
 # 1: perfect observations
 # 2: logistic error (i.e. symmetric, but with heavier tails than a gaussian)
@@ -105,7 +105,7 @@ for ens in ${ens_range[@]}; do
 	
 	    
         # Setup temporary run directory for each experiment
-        export runp=${dartp}/experiments/output/l63/run_${postf}
+        export runp=${dartp}/experiments/output/l05/run_${postf}
         export initp=${runp}/initial
 
 	# before each experiment, generate obs file with prescribed obs error
@@ -129,7 +129,7 @@ for ens in ${ens_range[@]}; do
 		echo " Running $estring"
 		echo "--------------------------------"
 		echo " "
-		./run_l63_dart.sh
+		./run_l05_dart.sh
 	    else
 		echo " Skipping $estring"
 	    fi
@@ -149,8 +149,8 @@ for ens in ${ens_range[@]}; do
 
 	    cp plot_evolution.py plot_evolution_base.py
 	    sed -e "s/exp_leaf = ''.*/exp_leaf = '${postf}'/g" \
-		-e "s/exp_name =.*/exp_name = 'l63\/${OUTPUT_DIR_NAME}\/filter'/g" \
-		-e "s/model=''.*/model='l63'/g" \
+		-e "s/exp_name =.*/exp_name = 'l05\/${OUTPUT_DIR_NAME}\/filter'/g" \
+		-e "s/model=''.*/model='l05'/g" \
 		plot_evolution.py > plot_evolution.py.edit
 	    mv plot_evolution.py.edit plot_evolution.py
 

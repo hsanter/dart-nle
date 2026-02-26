@@ -14,8 +14,8 @@ import matplotlib.pyplot as plt
 exp_leaf = ''
 exp_name = ''
 
-path_stem = '/Users/santer/dart-nle/experiments/work/run_'
-path_leaf = 'control'
+model=''
+
 out_plot_leaf = ''
 
 num_not_found = 0
@@ -30,7 +30,7 @@ try:
     print('/Users/santer/dart-nle/experiments/output/' +
                        exp_name + '1/rmse_' + exp_leaf + '_1.npy')
     drz_rmse = np.load('/Users/santer/dart-nle/experiments/output/' +
-                       exp_name + '1/rmse_' + exp_leaf + '_1.npy').mean(axis=1)
+                       exp_name + '1/rmse_' + exp_leaf + '_1.npy')
     len_rmse = len(drz_rmse)
     found_drz = True
 except FileNotFoundError:
@@ -39,7 +39,7 @@ except FileNotFoundError:
 
 try:
     kar_rmse = np.load('/Users/santer/dart-nle/experiments/output/' +
-                       exp_name + '2/rmse_' + exp_leaf + '_2.npy').mean(axis=1)
+                       exp_name + '2/rmse_' + exp_leaf + '_2.npy')
     len_rmse = len(kar_rmse)
     found_kar = True
 except FileNotFoundError:
@@ -48,7 +48,7 @@ except FileNotFoundError:
 
 try:
     big_rmse = np.load('/Users/santer/dart-nle/experiments/output/' +
-                       exp_name + '4/rmse_' + exp_leaf + '_4.npy').mean(axis=1)
+                       exp_name + '4/rmse_' + exp_leaf + '_4.npy')
     len_rmse = len(big_rmse)
     found_big = True
 except FileNotFoundError:
@@ -57,7 +57,7 @@ except FileNotFoundError:
 
 try:
     cnt_rmse = np.load('/Users/santer/dart-nle/experiments/output/' +
-                       exp_name + '0/rmse_' + exp_leaf + '_0.npy').mean(axis=1)
+                       exp_name + '0/rmse_' + exp_leaf + '_0.npy')
     len_rmse = len(cnt_rmse)
     found_cnt = True
 except FileNotFoundError:
@@ -66,7 +66,7 @@ except FileNotFoundError:
 
 try:
     bigs_rmse = np.load('/Users/santer/dart-nle/experiments/output/' +
-                       exp_name + '3/rmse_' + exp_leaf + '_3.npy').mean(axis=1)
+                       exp_name + '3/rmse_' + exp_leaf + '_3.npy')
     len_rmse = len(bigs_rmse)
     found_bigs = True
 except FileNotFoundError:
@@ -121,7 +121,7 @@ elif exp_leaf == 'lognormal_bias_removed':
 
 rmsefig, rmseax = plt.subplots()
 
-for d in [0, 1, 2]:
+for d in [0, 1, 2, 4]:
     print("onto methods {}".format(methods[d]))
 
     # setup
@@ -134,10 +134,10 @@ for d in [0, 1, 2]:
                 "(average=" + str(plot_vals_mean) + ")", alpha=0.75)
 
 rmseax.set_xlabel('Assimilation Step')
-rmseax.set_ylabel('RMSE')
+rmseax.set_ylabel('T-B RMSE')
 
 rmseax.set_title("RMSEs - " + exp_name)
 rmseax.legend()
-rmsefig.savefig('/Users/santer/dart-nle/experiments/output/run_' +
+rmsefig.savefig('/Users/santer/dart-nle/experiments/output/'+model+'/' + 'run_'+
                        exp_leaf + '/rmses.png')
 plt.close(rmsefig)

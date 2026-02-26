@@ -220,6 +220,26 @@
    ud_file_name    = 'temp_uc.nc'
    /
 
+&obs_grouping_tool_nml
+   filename_seq         = 'obs_seq.out',
+   filename_subset_spec = 'subsets.in'
+   filename_out         = 'obs_seq.out.grouped'
+   /
+
+&obs_estimation_nml
+   temporal_smoothing     = 0.005,
+   obs_estimation_flavor  = 0,
+   use_variances          = .true.,
+   window_width_days      = -1,
+   window_width_seconds   = -1,
+   rho_lower_bound    = 0.25,
+   rho_upper_bound    = 100.0,
+   sd_lower_bound         = 0.01,
+   sd_max_change          = 2.0,
+   initial_obs_inflate    = 1.0,
+   initial_obs_inflate_sd = 0.25,
+/
+
 &model_mod_check_nml
   input_state_files     = 'perfect_input.nc'
   output_state_files    = 'mmc_output.nc'

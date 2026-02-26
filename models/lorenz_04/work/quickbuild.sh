@@ -18,6 +18,7 @@ closest_member_tool
 filter
 model_mod_check
 perfect_model_obs
+obs_grouping_tool
 )
 
 serial_programs=(
