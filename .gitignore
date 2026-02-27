@@ -3,6 +3,7 @@
 *.mod
 *.o
 *.swp
+*.nc
 *__pycache__*
 *obscount.txt
 *region?.ps
@@ -13,8 +14,11 @@ _site/
 .cppdefs
 **/set_def.out
 **/obs_seq.out
+**/obs_seq.out.grouped
+**/obs_seq.out.**
 **/obs_seq.in
 **/obs_seq.final
+**/nohup.out
 
 # Nuisance files
 
