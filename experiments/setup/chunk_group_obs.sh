@@ -2,7 +2,11 @@ export n=$1
 
 cp input.nml input.nml.orig
 
-python chunk_obs_seq.py obs_seq.out.${postf} "${n}" "obs_chunks/obs_seq.out.${postf}"
+python chunk_obs_seq.py obs_seq.out.${postf} "${n}" "obs_chunks/obs_seq.out.${postf}" ${chunk_len_secs} ${chunk_len_days}
+
+echo $chunk_len_secs
+echo $chunk_len_days
+echo squireel
 
 for (( i=1; i<=n; i++ )); do
   sed \

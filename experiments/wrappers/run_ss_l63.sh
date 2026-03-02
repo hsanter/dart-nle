@@ -1,5 +1,6 @@
 #!/bin/sh
 
+
 # -------------------------------------------------------------
 # Henry Santer: February 2026
 #
@@ -21,7 +22,15 @@ function check_path
 # --- Specify run options ---
 export run_filter=true      # Run ensemble filter
 export run_plotting=false      # Run plotting routines
-export n_chunks=2
+
+# --- How to divy up obs sequence files ---
+# CHANGE THESE THREE VARIABLES TOGETHER
+export n_chunks=10
+export chunk_len_days=8
+export chunk_len_secs=28800
+
+
+# --- KECD Options ---
 
 
 export exp='L63 Experiment'
@@ -48,8 +57,8 @@ export plotcp=${dartp}/experiments/plotting
 #    cutoff_range         <-- localization length scale
 #    NL_FRAC_NEFF         <-- ensemble size fraction used for regularization (PF)
 
-ens_range=( 20 )
-obs_est_flavor_range=( 0 )
+ens_range=( 40 )
+obs_est_flavor_range=( 0 1 )
 # 0: unchanged obs errors
 # 1: perfect observations
 # 2: logistic error (i.e. symmetric, but with heavier tails than a gaussian)
@@ -59,7 +68,7 @@ obs_est_flavor_range=( 0 )
 # 6: lower variance gaussian
 # 7: biased gaussian
 # 8: bias-corrected lognormal
-experiment_range=( 0 )
+experiment_range=( 0 5 )
 
 
 for ens in ${ens_range[@]}; do

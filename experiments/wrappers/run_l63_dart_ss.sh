@@ -78,7 +78,7 @@ if ${run_initial}; then
    python nongaussian_error.py obs_seq.out ${EXP_FLAG}
 
    # assign obs group numbers in obs sequence
-   ./chunk_group_obs.sh ${n_chunks} ${postf}
+   ./chunk_group_obs.sh ${n_chunks} ${postf} > obs_chunking.log
    
 
    echo " ============================================"
@@ -109,6 +109,9 @@ if ${run_filter}; then
    ln -sf ${modp}/obs_sequence_tool ./
    ln -sf ${modp}/subsets.in ./
    ln -sf ${shellp}/save_rmses.py ./
+   ln -sf ${datap}/join_obs_seqs.py ./
+   ln -sf ${datap}/join_obs_seqs.sh ./
+   ln -sf ${modp}/obs_grouping_tool ./
 
    # Run filter
    echo "Starting to filter!"
@@ -122,6 +125,9 @@ if ${run_filter}; then
        mv obs_seq.final.${postf} output_chunks/obs_seq.final.${postf}.${i}
        cp filter_output.nc filter_input.nc
    done
+
+   ./join_obs_seqs.sh ${n_chunks} > obs_joining.log
+   
 
 
    echo " ============================================"
