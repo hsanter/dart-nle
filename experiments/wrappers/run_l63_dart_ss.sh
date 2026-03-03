@@ -120,6 +120,7 @@ if ${run_filter}; then
 
 
    for (( i=1; i<=${n_chunks}; i++ )); do
+       echo ${i}
        cp obs_chunks/obs_seq.out.${postf}.${i} obs_seq.out
        mpirun -np 3 ./filter >& output.log
        mv obs_seq.final.${postf} output_chunks/obs_seq.final.${postf}.${i}
