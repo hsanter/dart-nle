@@ -36,9 +36,9 @@ fi
 
 # --- How to divy up obs sequence files ---
 # CHANGE THESE THREE VARIABLES TOGETHER
-export n_chunks=8
-export chunk_len_days=52
-export chunk_len_secs=7200
+export n_chunks=2000
+export chunk_len_days=0
+export chunk_len_secs=18000
 
 
 # --- KECD Options ---
