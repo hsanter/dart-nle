@@ -21,7 +21,7 @@ function check_path
 
 # --- Specify run options ---
 export run_filter=true      # Run ensemble filter
-export run_plotting=false      # Run plotting routines
+export run_plotting=true      # Run plotting routines
 export rmse_type=4
 
 if [[ $rmse_type == 1 ]]; then
@@ -59,6 +59,7 @@ export dartp=/Users/santer/dart-nle
 export modp=${dartp}/models/lorenz_63/work
 export datap=${dartp}/experiments/setup
 export shellp=${dartp}/experiments/wrappers
+export scriptp=${dartp}/experiments/scripts
 export plotcp=${dartp}/experiments/plotting
 
 

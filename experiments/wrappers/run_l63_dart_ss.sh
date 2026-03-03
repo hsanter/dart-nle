@@ -108,7 +108,7 @@ if ${run_filter}; then
    cp ${modp}/filter_input.nc ./
    ln -sf ${modp}/obs_sequence_tool ./
    ln -sf ${modp}/subsets.in ./
-   ln -sf ${shellp}/save_rmses.py ./
+   ln -sf ${scriptp}/save_rmses.py ./
    ln -sf ${datap}/join_obs_seqs.py ./
    ln -sf ${datap}/join_obs_seqs.sh ./
    ln -sf ${modp}/obs_grouping_tool ./
@@ -128,17 +128,20 @@ if ${run_filter}; then
 
    ./join_obs_seqs.sh ${n_chunks} > obs_joining.log
    
-
-
-   echo " ============================================"
-
-   if ${run_plotting}; then
-       python ${plotcp}/plot_rmse.py output_chunks/obs_seq.final.${postf}.joined "${rmse_label} RMSEs" ppo_rmses.png ${rmse_type}
-
-       echo " Finished plotting for experiment ${postf} "
-   fi
-
 fi
+
+
+
+echo " ============================================"
+
+if ${run_plotting}; then
+    echo " Plotting for experiment ${postf} "
+    cd ${filterp}
+    python ${plotcp}/plot_rmse.py output_chunks/obs_seq.final.${postf}.joined "${rmse_label} RMSEs" ppo_rmses.png ${rmse_type}
+    
+    echo " Finished plotting for experiment ${postf} "
+fi
+
 
 
 echo " ============================================"

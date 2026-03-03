@@ -29,7 +29,7 @@ obs_type ="RAW_STATE_VARIABLE"
 
 df = obs_seq.df
 stats.diag_stats(df)
-stats.bin_by_time(df,'10800s')
+stats.bin_by_time(df,'18000s')
 tick_interval=800
 time_format='%m-%d'
 df_by_time = stats.time_statistics(df)
