@@ -191,7 +191,7 @@
 
 &obs_estimation_nml
    temporal_smoothing     = 0.005,
-   obs_estimation_flavor  = 3,
+   obs_estimation_flavor  = 0,
    use_variances          = .true.,
    window_width_days      = -1,
    window_width_seconds   = -1,

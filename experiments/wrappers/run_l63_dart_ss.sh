@@ -131,18 +131,12 @@ if ${run_filter}; then
 
 
    echo " ============================================"
-   # echo "   Filter complete - running obs space diagnostics"
-   # # Run obs_diag
-   # ./obs_diag >& output_obs.log
 
+   if ${run_plotting}; then
+       python ${plotcp}/plot_rmse.py output_chunks/obs_seq.final.${postf}.joined "${rmse_label} RMSEs" ppo_rmses.png ${rmse_type}
 
-   # cp obs_diag_output.nc obs_diag_output_${NL_OBS_EST_FLAVOR}.nc
-
-   # if ${run_plotting}; then
-   #     python ${plotcp}/plot_rmse.py obs_seq.final.${postf}.${NL_OBS_EST_FLAVOR} "Prior RMSEs" ppo_rmses.png
-   # fi
-
-   # python save_rmses.py obs_diag_output_${NL_OBS_EST_FLAVOR}.nc rmse_${postf}_${NL_OBS_EST_FLAVOR}.npy ${postf}
+       echo " Finished plotting for experiment ${postf} "
+   fi
 
 fi
 

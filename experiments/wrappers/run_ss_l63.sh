@@ -22,12 +22,23 @@ function check_path
 # --- Specify run options ---
 export run_filter=true      # Run ensemble filter
 export run_plotting=false      # Run plotting routines
+export rmse_type=4
+
+if [[ $rmse_type == 1 ]]; then
+    export rmse_label='OMB'
+elif [[ $rmse_type == 2 ]]; then
+    export rmse_label='OMA'
+elif [[ $rmse_type == 3 ]]; then
+    export rmse_label='TMB'
+elif [[ $rmse_type == 4 ]]; then
+    export rmse_label='TMA'
+fi
 
 # --- How to divy up obs sequence files ---
 # CHANGE THESE THREE VARIABLES TOGETHER
-export n_chunks=10
-export chunk_len_days=8
-export chunk_len_secs=28800
+export n_chunks=8
+export chunk_len_days=52
+export chunk_len_secs=7200
 
 
 # --- KECD Options ---
@@ -58,7 +69,7 @@ export plotcp=${dartp}/experiments/plotting
 #    NL_FRAC_NEFF         <-- ensemble size fraction used for regularization (PF)
 
 ens_range=( 40 )
-obs_est_flavor_range=( 0 1 )
+obs_est_flavor_range=( 0 )
 # 0: unchanged obs errors
 # 1: perfect observations
 # 2: logistic error (i.e. symmetric, but with heavier tails than a gaussian)
@@ -68,7 +79,7 @@ obs_est_flavor_range=( 0 1 )
 # 6: lower variance gaussian
 # 7: biased gaussian
 # 8: bias-corrected lognormal
-experiment_range=( 0 5 )
+experiment_range=( 0 )
 
 
 for ens in ${ens_range[@]}; do
@@ -134,28 +145,6 @@ for ens in ${ens_range[@]}; do
 
 		
 	done
-	
-	    # start plotting
-	    
-	    
-	if ${run_plotting}; then
-
-	    cp plot_evolution.py plot_evolution_base.py
-	    sed -e "s/exp_leaf = ''.*/exp_leaf = '${postf}'/g" \
-		-e "s/exp_name =.*/exp_name = 'l63\/${OUTPUT_DIR_NAME}\/filter'/g" \
-		-e "s/model=''.*/model='l63'/g" \
-		plot_evolution.py > plot_evolution.py.edit
-	    mv plot_evolution.py.edit plot_evolution.py
-
-	    
-	    echo $estring >> plotting_stats.out
-	    python plot_evolution.py >> plotting_stats.out
-
-	    mv plot_evolution_base.py plot_evolution.py
-	    
-	    
-	    echo "Finished plotting for experiment ${exp_f}"
-	fi
     done	# param for
 done
 
