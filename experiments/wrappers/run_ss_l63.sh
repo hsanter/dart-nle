@@ -115,7 +115,7 @@ for ens in ${ens_range[@]}; do
         export initp=${runp}/initial
 
 	# before each experiment, generate obs file with prescribed obs error
-	export run_initial=true     # Generate obs from a truth simulation
+	export run_initial=false     # Generate obs from a truth simulation
 	
 	export OUTPUT_DIR_NAME=run_${postf}
 	echo $OUTPUT_DIR_NAME
