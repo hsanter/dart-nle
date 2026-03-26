@@ -92,6 +92,10 @@ public :: filter_assim, &
           test_state_copies, &
           update_ens_from_weights  ! Jeff thinks this routine is in the wild.
 
+! HMS 2026: temporary for writing debug stuff
+integer :: debugfileunit = 58
+! /hms26
+
 ! Indicates if module initialization subroutine has been called yet
 logical :: module_initialized = .false.
 
@@ -220,6 +224,12 @@ logical  :: only_area_adapt  = .true.
 ! compared to previous versions of this namelist item.
 logical  :: distribute_mean  = .false.
 
+
+
+! HMS 2026: flag to see if weights computed with kernel embeddings of
+! conditional distributions should be applied
+logical :: use_externally_prescribed_pf_weights = .false.
+
 ! New namelist variables added for local PF
 namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    spread_restoration, sampling_error_correction,                          &
@@ -231,7 +241,8 @@ namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    special_localization_obs_types, special_localization_cutoffs,           &
    distribute_mean, close_obs_caching,                                     &
    adjust_obs_impact, obs_impact_filename, allow_any_impact_values,        &
-   convert_all_state_verticals_first, convert_all_obs_verticals_first
+   convert_all_state_verticals_first, convert_all_obs_verticals_first,     &
+   use_externally_prescribed_pf_weights
 
 !============================================================================
 
@@ -373,6 +384,14 @@ real(r8), allocatable :: close_state_dist(:)
 real(r8), allocatable :: last_close_obs_dist(:)
 real(r8), allocatable :: last_close_state_dist(:)
 
+! HMS 2026: kecd stuff
+real(r8), dimension(3,40) :: kecd_offline_p_weights
+integer(i8) :: kecd_ind
+integer(i8) :: kecd_file_unit
+
+! /hms26
+
+
 integer(i8) :: state_index
 integer(i8), allocatable :: my_state_indx(:)
 integer(i8), allocatable :: my_obs_indx(:)
@@ -386,7 +405,7 @@ real(r8) :: ens_init(ens_size,ens_handle%my_num_vars), pf_infl(obs_ens_handle%my
 real(r8) :: obs_ens_init(ens_size,obs_ens_handle%my_num_vars), obs_err_infl, hw(ens_size), wo(ens_size)
 real(r8) :: lw(ens_size,ens_handle%my_num_vars), lhw(ens_size,obs_ens_handle%my_num_vars), wp(ens_size,obs_ens_handle%my_num_vars)
 real(r8) :: beta(ens_handle%my_num_vars), beta_y(obs_ens_handle%my_num_vars)
-real(r8) :: w(ens_size), ens_mean, ens_var, ws, d(ens_size), wt(ens_size), temp1, temp2, beta_hw, neff
+real(r8) :: w(ens_size), ens_mean, ens_var, ws, d(ens_size), wt(ens_size), temp1, temp2, beta_hw, neff, neg_log_weights(ens_size)
 integer  :: indx(ens_size), filter_kind_orig
 real(r8) :: res(ens_handle%my_num_vars), res_y(obs_ens_handle%my_num_vars)
 integer  :: iter, maxiter
@@ -474,6 +493,9 @@ if (timing(MLOOP)) allocate(elapse_array(obs_ens_handle%num_vars))
 
 !timing(GC) = .true.
 !t_limit(GC) = 4_i8
+
+
+open(unit = debugfileunit, file = "exploratory.log", action='write', position='append',status='unknown')
 
 
 ! allocate rather than dump all this on the stack
@@ -725,6 +747,19 @@ ITERATIONS: do iter = 1,maxiter
    ! obs-and model-space weights prior to DA step
    if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
 
+   if (use_externally_prescribed_pf_weights) then
+      write (debugfileunit, *) 'spam meeeeee'
+      open(kecd_file_unit, file="pyx_next.txt",access='sequential',form="formatted")
+      write (debugfileunit, *) 'trying to read the weights'
+      do kecd_ind = 1, 40
+         read(kecd_file_unit, *) kecd_offline_p_weights(kecd_ind, :)
+      end do
+      write (debugfileunit, *) 'we actually read the weights'
+      close(kecd_file_unit)
+   end if
+
+!!$   write (debugfileunit, *) kecd_offline_p_weights
+
    REGULARIZATION: do i = 1, obs_ens_handle%num_vars
 
       ! Every pe has information about the global obs sequence
@@ -750,16 +785,34 @@ ITERATIONS: do iter = 1,maxiter
    
         obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
 
+
         if(nint(obs_qc) == 0) then
 
           ! Likelihood calculations
-          orig_obs_prior = obs_ens_init(1:ens_size, owners_index)
-          d = (obs(1) - orig_obs_prior)**2 / (2.0_r8*obs_err_var) ! actual (part of) likelihood
-          d = d - minval(d) ! helps w round off
+!!$ ######################## change from here...
 
-          hw = exp( -d ) ! this is where im gonna slot my stuff in
-          hw = hw / sum(hw)
+          if (use_externally_prescribed_pf_weights) then
+        
+             hw = kecd_offline_p_weights(i, :)
+             hw = hw / sum(hw)
 
+          else
+
+             orig_obs_prior = obs_ens_init(1:ens_size, owners_index)
+             d = (obs(1) - orig_obs_prior)**2 / (2.0_r8*obs_err_var) ! actual (part of) likelihood
+             d = d - minval(d) ! helps w round off
+
+             hw = exp( -d ) ! this is where im gonna slot my stuff in
+             hw = hw / sum(hw)
+
+          end if
+          
+          neg_log_weights = -log(hw)
+
+!!$          write(debugfileunit, *) "hw kecd (from text file, normalized)"
+!!$          write(debugfileunit, *) hw
+
+!!$ ######################## to here...
           ! Determine whether to skip ob
           if (1.0_r8 > ens_size * 0.98_r8 *sum(hw**2) ) then
             ! write(*,*) 'Skipping with Neff =',1.0_r8 / sum(hw**2)
@@ -767,17 +820,17 @@ ITERATIONS: do iter = 1,maxiter
             obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index) = 1
           else
 
-            temp1 = max( 1.0_r8, maxval(d)/80.0_r8 )
-            call pf_regularization_minw(d/temp1, 1E-10_r8 / ens_size, ens_size, obs_err_infl)
+            temp1 = max( 1.0_r8, maxval(neg_log_weights)/80.0_r8 )
+            call pf_regularization_minw(neg_log_weights/temp1, 1E-10_r8 / ens_size, ens_size, obs_err_infl)
 
             pf_infl(owners_index) = obs_err_infl*temp1
 
-            hw = exp( -d/pf_infl(owners_index) )
+            ! q: how do 
+            hw = exp( -neg_log_weights/pf_infl(owners_index) )
             hw = hw / sum(hw)
 
             ! Save inflation and weights
             wp(1:ens_size,owners_index) = hw
-
           end if
 
         end if
@@ -984,7 +1037,7 @@ ITERATIONS: do iter = 1,maxiter
 
    if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'regularization')
 
-   ! Reset -log() weights to zero for sequential udpate step
+   ! Reset -log() weights to zero for sequential update step
    lw  = 0.0_r8
    lhw = 0.0_r8
 
@@ -2100,6 +2153,8 @@ deallocate(close_state_dist,      &
 deallocate(n_close_state_items, &
            n_close_obs_items)
 ! end dealloc
+
+close(debugfileunit)
 
 end subroutine filter_assim
 
