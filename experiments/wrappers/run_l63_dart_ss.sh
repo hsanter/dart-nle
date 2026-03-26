@@ -109,6 +109,8 @@ if ${run_filter}; then
    ln -sf ${modp}/obs_sequence_tool ./
    ln -sf ${modp}/subsets.in ./
    ln -sf ${scriptp}/save_rmses.py ./
+   ln -sf ${scriptp}/compute_kecd_likelihood.py ./
+   ln -sf ${scriptp}/weights_kecd.py ./
    ln -sf ${datap}/join_obs_seqs.py ./
    ln -sf ${datap}/join_obs_seqs.sh ./
    ln -sf ${modp}/obs_grouping_tool ./
@@ -120,10 +122,45 @@ if ${run_filter}; then
 
 
    for (( i=1; i<=${n_chunks}; i++ )); do
+
+
+       sed -e "s/use_externally_prescribed_pf_weights.*/use_externally_prescribed_pf_weights = .false.,/g" \
+	   input.nml > input.nml.edit
+       mv input.nml.edit input.nml
+
        echo ${i}
        cp obs_chunks/obs_seq.out.${postf}.${i} obs_seq.out
        mpirun -np 3 ./filter >& output.log
+
        mv obs_seq.final.${postf} output_chunks/obs_seq.final.${postf}.${i}
+
+       if [[ ${kecd_estimation} > 1 ]]; then
+	   if [[ $i -ge ${n_train} ]]; then
+	       if (( ($i - ${n_train}) % ${compute_pyx_every} == 0 )); then
+
+		   echo "============================================"
+		   echo "Computing KECD weights at time ${i} ..."
+		   echo "============================================"
+
+		   python compute_kecd_likelihood.py output_chunks/obs_seq.final.${postf}. ${i} ${n_train} pyx.npz ${train_on_truth} ${bw} ${knnf} ${chunk_len_days} ${chunk_len_secs}
+
+	       fi
+
+	       python weights_kecd.py output_chunks/obs_seq.final.${postf}.${i} pyx_next.txt
+
+	       sed -e "s/use_externally_prescribed_pf_weights.*/use_externally_prescribed_pf_weights = .true.,/g" \
+		   input.nml > input.nml.edit
+	       mv input.nml.edit input.nml
+
+	       echo "\n\nRerunning filter with externally prescribed weights \n\n" >& output.log
+	       echo "made it to second filter without issue - running filter w kecd weights"
+	       mpirun -np 3 ./filter >& output.log
+	       
+	       mv obs_seq.final.${postf} output_chunks/obs_seq.final.${postf}.${i}
+	       echo "Finished attempting the second filter"
+	   fi
+       fi
+
        cp filter_output.nc filter_input.nc
    done
 

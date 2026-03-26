@@ -2,7 +2,7 @@
    /
 
 &algorithm_info_nml
-   qceff_table_filename = 'eakf_qceff_table.csv'
+   qceff_table_filename = ''
    /
 
 &perfect_model_obs_nml
@@ -46,11 +46,11 @@
    output_state_file_list       = 'filter_output_list.txt'
    output_interval              = 1,
    output_members               = .true.
-   num_output_state_members     = 80,
+   num_output_state_members     = 40,
    output_mean                  = .true.
    output_sd                    = .true.
 
-   ens_size                     = 20,
+   ens_size                     = 40,
    num_groups                   = 1,
    perturb_from_single_instance = .false.,
    perturbation_amplitude       = 0.2,
@@ -61,7 +61,7 @@
 
    obs_sequence_in_name         = "obs_seq.out",
    obs_sequence_out_name        = "obs_seq.final",
-   num_output_obs_members       = 80,
+   num_output_obs_members       = 40,
    init_time_days               = 0,
    init_time_seconds            = 0,
    first_obs_days               = -1,
@@ -93,15 +93,18 @@
    /
 
 &assim_tools_nml
-   cutoff                          = 0.2,
+   cutoff                          = 0.3,
    sort_obs_inc                    = .false.,
    spread_restoration              = .false.,
    sampling_error_correction       = .false.,
    adaptive_localization_threshold = -1,
    output_localization_diagnostics = .false.,
+   use_externally_prescribed_pf_weights = .false.,
    localization_diagnostics_file   = 'localization_diagnostics',
    print_every_nth_obs             = 0,
+   sampling_weighted_prior         = .false.,
    rectangular_quadrature          = .true.,
+   
    gaussian_likelihood_tails       = .false.,
    /
 

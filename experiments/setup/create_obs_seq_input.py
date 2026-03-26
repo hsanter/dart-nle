@@ -1,5 +1,5 @@
 
-n_obs = 480
+n_obs = 40
 obs_err_var = 1
 
 with open("cos_input.txt", "w") as f:

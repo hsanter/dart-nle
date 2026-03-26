@@ -21,7 +21,7 @@ function check_path
 
 # --- Specify run options ---
 export run_filter=true      # Run ensemble filter
-export run_plotting=true      # Run plotting routines
+export run_plotting=false      # Run plotting routines
 export rmse_type=4
 
 if [[ $rmse_type == 1 ]]; then
@@ -36,15 +36,39 @@ fi
 
 # --- How to divy up obs sequence files ---
 # CHANGE THESE THREE VARIABLES TOGETHER
-export n_chunks=2000
+export n_chunks=400
 export chunk_len_days=0
-export chunk_len_secs=18000
+export chunk_len_secs=3600
 
 
 # --- KECD Options ---
 
+# 1: no estimation
+# 2: likelihood estimation 
+export kecd_estimation=2
+export train_on_truth=true
+export bw=0.02
+export knnf=0.1
+export n_train=400
+export compute_pyx_every=50
 
-export exp='L63 Experiment'
+
+# -- Model Options --
+
+# 1: L63
+# 2: L96
+# 3: L04?
+export m_flag=2
+
+if [[ $m_flag == 1 ]]; then
+    export model='63'
+elif [[ $m_flag == 2 ]]; then
+    export model='96'
+elif [[ $m_flag == 3 ]]; then
+    export model='04'
+fi
+
+export exp="L${model} Experiment"
 
 echo " "
 echo "-------------------------------------------------"
@@ -56,7 +80,7 @@ echo " "
 
 # Paths to data and DART components
 export dartp=/Users/santer/dart-nle
-export modp=${dartp}/models/lorenz_63/work
+export modp=${dartp}/models/lorenz_${model}/work
 export datap=${dartp}/experiments/setup
 export shellp=${dartp}/experiments/wrappers
 export scriptp=${dartp}/experiments/scripts
@@ -69,7 +93,7 @@ export plotcp=${dartp}/experiments/plotting
 #    cutoff_range         <-- localization length scale
 #    NL_FRAC_NEFF         <-- ensemble size fraction used for regularization (PF)
 
-ens_range=( 40 )
+ens_range=( 80 )
 obs_est_flavor_range=( 0 )
 # 0: unchanged obs errors
 # 1: perfect observations
@@ -80,7 +104,7 @@ obs_est_flavor_range=( 0 )
 # 6: lower variance gaussian
 # 7: biased gaussian
 # 8: bias-corrected lognormal
-experiment_range=( 0 )
+experiment_range=( 3 )
 
 
 for ens in ${ens_range[@]}; do
@@ -111,7 +135,7 @@ for ens in ${ens_range[@]}; do
 	
 	    
         # Setup temporary run directory for each experiment
-        export runp=${dartp}/experiments/output/l63/run_${postf}
+        export runp=${dartp}/experiments/output/l${model}/run_${postf}
         export initp=${runp}/initial
 
 	# before each experiment, generate obs file with prescribed obs error

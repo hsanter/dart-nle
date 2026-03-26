@@ -42,7 +42,7 @@ def gen_obs_with_error(true_val, flag):
         return true_val + logistic_error(0, 1.10265779084, 20)
     elif flag == STATE_DEP:
         # state, cutoff, m1, v1, m2, v2
-        return true_val + state_dependent_error(true_val, 0, 1, 1, -1, 1)
+        return true_val + state_dependent_error(true_val, 0, 2, 1, -2, 1)
     elif flag == LOGNORMAL:
         # mean, STANDARD DEVIATION, upper bound
         return true_val + lognormal_error(LN_MU, LN_SIGMA)

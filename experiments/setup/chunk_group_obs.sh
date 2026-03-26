@@ -4,10 +4,6 @@ cp input.nml input.nml.orig
 
 python chunk_obs_seq.py obs_seq.out.${postf} "${n}" "obs_chunks/obs_seq.out.${postf}" ${chunk_len_secs} ${chunk_len_days}
 
-echo $chunk_len_secs
-echo $chunk_len_days
-echo squireel
-
 for (( i=1; i<=n; i++ )); do
   sed \
     -e "s/filename_seq[[:space:]]*=[[:space:]]*'obs_seq.out',/filename_seq         = 'obs_seq.out.${postf}.${i}',/" \

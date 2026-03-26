@@ -100,14 +100,17 @@
    /
 
 &assim_tools_nml
-   cutoff                          = 1000000.0
+   cutoff                          = 0.3
+   pf_maxiter                      = 1
    sort_obs_inc                    = .false.,
    spread_restoration              = .false.,
    sampling_error_correction       = .false.,
+   use_externally_prescribed_pf_weights = .false.,
    adaptive_localization_threshold = -1,
    distribute_mean                 = .false.
    output_localization_diagnostics = .false.,
    localization_diagnostics_file   = 'localization_diagnostics',
+   sampling_weighted_prior         = .false.
    print_every_nth_obs             = 0
    /
 

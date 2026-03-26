@@ -1,14 +1,28 @@
 ! DART software - Copyright UCAR. This open source software is provided
 ! by UCAR, "as is", without charge, subject to all terms of use at
 ! http://www.image.ucar.edu/DAReS/DART/DART_download
-
+!
+!
+!
+!!!!!!!!!!!!!!!!!!!!!!  PLEASE READ BEFORE USING  !!!!!!!!!!!!!!!!!!!!!!
+!
+! This version of assim_tools_mod supports ongoing developments toward a
+! localized particle filter (Poterjoy 2016; Poterjoy and Anderson 2016;
+! Poterjoy et al. 2019; Poterjoy 2021). It should NOT be used with 'filter 
+! kind' other than 9 or with any sort of adaptive prior/posterior inflation.
+! A breakdown of namelist options specific to the local PF are described
+! below. They include options to use a hybrid PF-EAKF update, which performs
+! a partial assimilation of observations with the PF followed by a second
+! update using the EAKF (Poterjoy 2021). Please contact the developer
+! (Jon Poterjoy, poterjoy@umd.edu) before using.
+!
 !>  A variety of operations required by assimilation.
 module assim_tools_mod
 
 !> \defgroup assim_tools assim_tools_mod
 !>
 !> @{
-use      types_mod,       only : r8, i8, PI, missing_r8
+use      types_mod,       only : r8, i8, digits12, PI, missing_r8
 
 use    options_mod,       only : get_missing_ok_status
 
@@ -16,7 +30,7 @@ use  utilities_mod,       only : file_exist, get_unit, check_namelist_read, do_o
                                  find_namelist_in_file, error_handler,   &
                                  E_ERR, E_MSG, nmlfileunit, do_nml_file, do_nml_term,     &
                                  open_file, close_file, timestamp
-use       sort_mod,       only : index_sort
+use       sort_mod,       only : index_sort 
 use random_seq_mod,       only : random_seq_type, random_gaussian, init_random_seq,       &
                                  random_uniform
 
@@ -52,12 +66,11 @@ use ensemble_manager_mod, only : ensemble_type, get_my_num_vars, get_my_vars,   
 
 use mpi_utilities_mod,    only : my_task_id, broadcast_send, broadcast_recv,              &
                                  sum_across_tasks, task_count, start_mpi_timer,           &
-                                 read_mpi_timer, task_sync
+                                 read_mpi_timer, task_sync, get_global_max
 
 use adaptive_inflate_mod, only : do_obs_inflate,  do_single_ss_inflate, do_ss_inflate,    &
                                  do_varying_ss_inflate,                                   &
-                                 update_inflation, update_single_state_space_inflation,   &
-                                 update_varying_state_space_inflation,                    &
+                                 update_inflation,                                        &
                                  inflate_ens, adaptive_inflate_type,                      &
                                  deterministic_inflate, solve_quadratic
 
@@ -71,34 +84,17 @@ use distributed_state_mod, only : create_mean_window, free_mean_window
 
 use quality_control_mod, only : good_dart_qc, DARTQC_FAILED_VERT_CONVERT
 
-use probit_transform_mod, only : transform_to_probit, transform_from_probit, &
-                                   transform_all_from_probit
-
-use normal_distribution_mod, only : normal_cdf, inv_weighted_normal_cdf
-
-use algorithm_info_mod, only : probit_dist_info, obs_inc_info, EAKF, ENKF, &
-                               BOUNDED_NORMAL_RHF, UNBOUNDED_RHF, GAMMA_FILTER, &
-                               KERNEL, OBS_PARTICLE, KDE_FILTER
-
-use gamma_distribution_mod, only : gamma_cdf, inv_gamma_cdf, gamma_mn_var_to_shape_scale, &
-                                   gamma_gamma_prod
-
-use bnrh_distribution_mod, only   :  inv_bnrh_cdf, bnrh_cdf, inv_bnrh_cdf_like
-
-use kde_distribution_mod, only : kde_cdf_params, inv_kde_cdf_params, obs_dist_types,      &
-                                 pack_kde_params, likelihood_function, separate_ensemble, &
-                                 obs_increment_kde
-
-use distribution_params_mod, only : distribution_params_type, deallocate_distribution_params
-                               
-
 implicit none
 private
 
 public :: filter_assim, &
           set_assim_tools_trace, &
           test_state_copies, &
-          update_ens_from_weights
+          update_ens_from_weights  ! Jeff thinks this routine is in the wild.
+
+! HMS 2026: temporary for writing debug stuff
+integer :: debugfileunit = 58
+! /hms26
 
 ! Indicates if module initialization subroutine has been called yet
 logical :: module_initialized = .false.
@@ -114,6 +110,7 @@ integer                :: num_types = 0
 real(r8), allocatable  :: cutoff_list(:)
 logical                :: has_special_cutoffs
 logical                :: close_obs_caching = .true.
+real(r8), parameter    :: small = epsilon(1.0_r8)   ! threshold for avoiding NaNs/Inf
 
 ! true if we have multiple vert choices and we're doing vertical localization
 ! (make it a local variable so we don't keep making subroutine calls)
@@ -129,19 +126,53 @@ real(r8), allocatable  :: exp_true_correl(:), alpha(:)
 ! and fill this 2d impact table.
 real(r8), allocatable  :: obs_impact_table(:,:)
 
-character(len=*), parameter :: source = 'assim_tools_mod.f90'
+character(len=*), parameter :: source = 'assim_tools_mod.pf.f90'
 
 !============================================================================
 
 !---- namelist with default values
 
-real(r8) :: cutoff                          = 0.2_r8
-logical  :: sort_obs_inc                    = .true.
+! Filter kind selects type of observation space filter
+!      1 = EAKF filter
+!      2 = ENKF
+!      3 = Kernel filter
+!      4 = particle filter
+!      5 = random draw from posterior
+!      6 = deterministic draw from posterior with fixed kurtosis
+!      8 = Rank Histogram Filter (see Anderson 2011)
+!      9 = Localized particle filter (Poterjoy Nov. 2014)
+!
+!  special_localization_obs_types -> Special treatment for the specified observation types
+!  special_localization_cutoffs   -> Different cutoff value for each specified obs type
+!
+!
+! PF namelist variables: 
+!      frac_neff -> Effective ensemble size for regularization 
+!                   (set as fraction of ensemble size)
+!      pf_alpha -> Mixing coefficient for PF update step
+!      pf_kddm -> Flag for turning on probability mapping step
+!      sampling_weighted_prior -> Flag for turning on resampling from weighted prior
+!      pf_enkf_hybrid -> Flag for turning on hybrid PF-EnKF update
+!      min_residual -> Min residual for PF iterations (also used as hybrid parameter)
+!      pf_maxiter -> Max number of PF iterations for tempering
+!      pf_kf_rtps_coeff -> Relaxation to prior spread factor used for EnKF part of hybrid
+
+integer  :: filter_kind                     = 9
+real(r8) :: cutoff                          = 0.3_r8
+logical  :: sort_obs_inc                    = .false.
 logical  :: spread_restoration              = .false.
 logical  :: sampling_error_correction       = .false.
 integer  :: adaptive_localization_threshold = -1
 real(r8) :: adaptive_cutoff_floor           = 0.0_r8
 integer  :: print_every_nth_obs             = 0
+real(r8) :: frac_neff                       = 0.20_r8
+real(r8) :: pf_alpha                        = 0.30_r8
+integer  :: pf_kddm                         = 0
+logical  :: sampling_weighted_prior         = .true.
+logical  :: pf_enkf_hybrid                  = .false.
+real(r8) :: min_residual                    = 0.5_r8
+integer  :: pf_maxiter                      = 3
+real(r8) :: pf_kf_rtps_coeff                = 0.0_r8
 
 ! since this is in the namelist, it has to have a fixed size.
 integer, parameter   :: MAX_ITEMS = 300
@@ -151,7 +182,7 @@ real(r8)             :: special_localization_cutoffs(MAX_ITEMS)
 logical              :: output_localization_diagnostics = .false.
 character(len = 129) :: localization_diagnostics_file = "localization_diagnostics"
 
-! Following only relevant for filter_kind = UNBOUNDED_RHF
+! Following only relevant for filter_kind = 8
 logical  :: rectangular_quadrature          = .true.
 logical  :: gaussian_likelihood_tails       = .false.
 
@@ -193,15 +224,25 @@ logical  :: only_area_adapt  = .true.
 ! compared to previous versions of this namelist item.
 logical  :: distribute_mean  = .false.
 
-namelist / assim_tools_nml / cutoff, sort_obs_inc,                         &
+
+
+! HMS 2026: flag to see if weights computed with kernel embeddings of
+! conditional distributions should be applied
+logical :: use_externally_prescribed_pf_weights = .false.
+
+! New namelist variables added for local PF
+namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    spread_restoration, sampling_error_correction,                          &
    adaptive_localization_threshold, adaptive_cutoff_floor,                 &
    print_every_nth_obs, rectangular_quadrature, gaussian_likelihood_tails, &
+   pf_kddm, frac_neff, pf_alpha, sampling_weighted_prior, pf_enkf_hybrid,  &
+   min_residual, pf_maxiter, pf_kf_rtps_coeff,                             &
    output_localization_diagnostics, localization_diagnostics_file,         &
    special_localization_obs_types, special_localization_cutoffs,           &
    distribute_mean, close_obs_caching,                                     &
    adjust_obs_impact, obs_impact_filename, allow_any_impact_values,        &
-   convert_all_state_verticals_first, convert_all_obs_verticals_first
+   convert_all_state_verticals_first, convert_all_obs_verticals_first,     &
+   use_externally_prescribed_pf_weights
 
 !============================================================================
 
@@ -238,9 +279,9 @@ if (do_nml_term()) write(     *     , nml=assim_tools_nml)
 ! Note null_win_mod.f90 ignores distibute_mean.
 if (task_count() == 1) distribute_mean = .true.
 
-if(spread_restoration) then
-   write(msgstring, *) 'The spread_restoration option is not supported in this version of ', &
-                       'DART. Contact the DAReS team if this option is needed '
+! FOR NOW, can only do spread restoration with filter option 1 (need to extend this)
+if(spread_restoration .and. .not. filter_kind == 1) then
+   write(msgstring, *) 'cannot combine spread_restoration and filter_kind ', filter_kind
    call error_handler(E_ERR,'assim_tools_init:', msgstring, source)
 endif
 
@@ -316,10 +357,6 @@ type(ensemble_type),         intent(inout) :: ens_handle, obs_ens_handle
 type(obs_sequence_type),     intent(in)    :: obs_seq
 integer,                     intent(in)    :: keys(:)
 integer,                     intent(in)    :: ens_size, num_groups, obs_val_index
-! JLA: At present, this only needs to be inout because of the possible use of
-! non-determinstic obs_space adaptive inflation that is not currently supported.
-! Implementing that would require communication of the info about the inflation
-! values as each observation updated them.
 type(adaptive_inflate_type), intent(inout) :: inflate
 integer,                     intent(in)    :: ENS_MEAN_COPY, ENS_SD_COPY, ENS_INF_COPY
 integer,                     intent(in)    :: ENS_INF_SD_COPY
@@ -330,38 +367,70 @@ logical,                     intent(in)    :: inflate_only
 
 ! changed the ensemble sized things here to allocatable
 
-real(r8) :: obs_prior(ens_size), obs_inc(ens_size)
-real(r8) :: obs_post(ens_size), probit_obs_prior(ens_size), probit_obs_post(ens_size)
-real(r8) :: final_factor
-real(r8) :: net_a(num_groups), correl(num_groups)
-real(r8) :: obs(1), obs_err_var, my_inflate, my_inflate_sd
-real(r8) :: obs_qc, cutoff_rev, cutoff_orig
+real(r8) :: obs_prior(ens_size), obs_inc(ens_size), increment(ens_size)
+real(r8) :: reg_factor, impact_factor
+real(r8) :: net_a(num_groups), reg_coef(num_groups), correl(num_groups)
+real(r8) :: cov_factor, obs(1), obs_err_var, my_inflate, my_inflate_sd
+real(r8) :: varying_ss_inflate, varying_ss_inflate_sd
+real(r8) :: ss_inflate_base, obs_qc, cutoff_rev, cutoff_orig
+real(r8) :: gamma, ens_obs_mean, ens_obs_var, ens_var_deflate
+real(r8) :: r_mean, r_var
 real(r8) :: orig_obs_prior_mean(num_groups), orig_obs_prior_var(num_groups)
 real(r8) :: obs_prior_mean(num_groups), obs_prior_var(num_groups)
+real(r8) :: diff_sd, outlier_ratio
 real(r8) :: vertvalue_obs_in_localization_coord, whichvert_real
 real(r8), allocatable :: close_obs_dist(:)
 real(r8), allocatable :: close_state_dist(:)
+real(r8), allocatable :: last_close_obs_dist(:)
+real(r8), allocatable :: last_close_state_dist(:)
+
+! HMS 2026: kecd stuff
+real(r8), dimension(3,40) :: kecd_offline_p_weights
+integer(i8) :: kecd_ind
+integer(i8) :: kecd_file_unit
+
+! /hms26
+
 
 integer(i8) :: state_index
 integer(i8), allocatable :: my_state_indx(:)
 integer(i8), allocatable :: my_obs_indx(:)
 
-integer :: my_num_obs, i, j, owner, owners_index, my_num_state, ierr
-integer :: obs_mean_index, obs_var_index
+character(8)  :: date
+character(10) :: time
+real(r8), parameter :: beta_max = 1E10_r8
+
+real(r8) :: orig_obs_prior(ens_size), min_res, max_res
+real(r8) :: ens_init(ens_size,ens_handle%my_num_vars), pf_infl(obs_ens_handle%my_num_vars)
+real(r8) :: obs_ens_init(ens_size,obs_ens_handle%my_num_vars), obs_err_infl, hw(ens_size), wo(ens_size)
+real(r8) :: lw(ens_size,ens_handle%my_num_vars), lhw(ens_size,obs_ens_handle%my_num_vars), wp(ens_size,obs_ens_handle%my_num_vars)
+real(r8) :: beta(ens_handle%my_num_vars), beta_y(obs_ens_handle%my_num_vars)
+real(r8) :: w(ens_size), ens_mean, ens_var, ws, d(ens_size), wt(ens_size), temp1, temp2, beta_hw, neff, neg_log_weights(ens_size)
+integer  :: indx(ens_size), filter_kind_orig
+real(r8) :: res(ens_handle%my_num_vars), res_y(obs_ens_handle%my_num_vars)
+integer  :: iter, maxiter
+
+integer :: my_num_obs, i, j, n, owner, owners_index, my_num_state
+integer :: this_obs_key, obs_mean_index, obs_var_index
 integer :: grp_beg(num_groups), grp_end(num_groups), grp_size, grp_bot, grp_top, group
 integer :: num_close_obs, obs_index, num_close_states
-integer :: last_num_close_obs, last_num_close_states
+integer :: total_num_close_obs, last_num_close_obs, last_num_close_states
 integer :: base_obs_kind, base_obs_type, nth_obs
 integer :: num_close_obs_cached, num_close_states_cached
 integer :: num_close_obs_calls_made, num_close_states_calls_made
+integer :: localization_unit, secs, days, rev_num_close_obs
 integer :: whichvert_obs_in_localization_coord
-integer :: istatus, localization_unit
+integer :: istatus
 integer, allocatable :: close_obs_ind(:)
 integer, allocatable :: close_state_ind(:)
+integer, allocatable :: last_close_obs_ind(:)
+integer, allocatable :: last_close_state_ind(:)
 integer, allocatable :: my_obs_kind(:)
 integer, allocatable :: my_obs_type(:)
 integer, allocatable :: my_state_kind(:)
 integer, allocatable :: vstatus(:)
+
+character(len = 200) :: base_loc_text   ! longer than longest location formatting possible
 
 type(location_type)  :: base_obs_loc, last_base_obs_loc, last_base_states_loc
 type(location_type)  :: dummyloc
@@ -371,40 +440,82 @@ type(location_type), allocatable :: my_state_loc(:)
 type(get_close_type) :: gc_obs, gc_state
 type(obs_type)       :: observation
 type(obs_def_type)   :: obs_def
-type(time_type)      :: obs_time
+type(time_type)      :: obs_time, this_obs_time
 
-logical, allocatable :: obs_probit_trans_ok(:), state_probit_trans_ok(:)
+logical :: do_adapt_inf_update
 logical :: allow_missing_in_state
 logical :: local_single_ss_inflate
 logical :: local_varying_ss_inflate
 logical :: local_ss_inflate
 logical :: local_obs_inflate
 
-! Storage for normal probit conversion, keeps prior mean and sd for all state ensemble members
-type(distribution_params_type) :: state_dist_params(ens_handle%my_num_vars)
-type(distribution_params_type) :: obs_dist_params(obs_ens_handle%my_num_vars)
-integer :: dist_for_state, dist_for_obs
-type(distribution_params_type) :: temp_dist_params
-logical  :: bounded_below, bounded_above
-real(r8) :: lower_bound,   upper_bound
-real(r8) :: probit_ens(ens_size)
+type(location_type) :: lc(1)
+integer             :: kd(1)
+
+! timing related vars:
+! set timing(N) true to collect and print timing info
+integer, parameter :: Ntimers = 5
+integer, parameter :: MLOOP  = 1  ! main assimilation loop
+integer, parameter :: LG_GRN = 2  ! large section timings
+integer, parameter :: SM_GRN = 3  ! inner loops - use carefully!
+integer, parameter :: GC     = 4  ! get_close() related loops
+logical        :: timing(Ntimers)   ! enable or disable w/ this
+real(digits12) :: t_base(Ntimers)   ! storage for time info
+integer(i8)    :: t_items(Ntimers)  ! count of number of calls
+integer(i8)    :: t_limit(Ntimers)  ! limit on number printed
+real(digits12), allocatable :: elapse_array(:)
+
+integer, allocatable :: n_close_state_items(:), n_close_obs_items(:)
+
+! timing disabled by default
+timing(:)  = .false.
+t_base(:)  = 0.0_r8
+t_items(:) = 0_i8
+t_limit(:) = 0_i8
+
+! how about this?  look for imbalances in the tasks
+allocate(n_close_state_items(obs_ens_handle%num_vars), &
+         n_close_obs_items(  obs_ens_handle%num_vars))
+
+! turn these on carefully - they can generate a lot of output!
+! also, to be readable - at least with ifort:
+!  setenv FORT_FMT_RECL 1024
+! so output lines don't wrap.
+
+!timing(MLOOP)  = .true.
+!timing(LG_GRN) = .true.
+
+if (timing(MLOOP)) allocate(elapse_array(obs_ens_handle%num_vars))
+
+! use maxitems limit here or drown in output.
+!timing(SM_GRN) = .false.
+!t_limit(SM_GRN) = 4_i8
+
+!timing(GC) = .true.
+!t_limit(GC) = 4_i8
+
+
+open(unit = debugfileunit, file = "exploratory.log", action='write', position='append',status='unknown')
+
 
 ! allocate rather than dump all this on the stack
 allocate(close_obs_dist(     obs_ens_handle%my_num_vars), &
+         last_close_obs_dist(obs_ens_handle%my_num_vars), &
          close_obs_ind(      obs_ens_handle%my_num_vars), &
+         last_close_obs_ind( obs_ens_handle%my_num_vars), &
          vstatus(            obs_ens_handle%my_num_vars), &
          my_obs_indx(        obs_ens_handle%my_num_vars), &
          my_obs_kind(        obs_ens_handle%my_num_vars), &
          my_obs_type(        obs_ens_handle%my_num_vars), &
-         my_obs_loc(         obs_ens_handle%my_num_vars), &
-         obs_probit_trans_ok(obs_ens_handle%my_num_vars))
+         my_obs_loc(         obs_ens_handle%my_num_vars))
 
 allocate(close_state_dist(     ens_handle%my_num_vars), &
+         last_close_state_dist(ens_handle%my_num_vars), &
          close_state_ind(      ens_handle%my_num_vars), &
+         last_close_state_ind( ens_handle%my_num_vars), &
          my_state_indx(        ens_handle%my_num_vars), &
          my_state_kind(        ens_handle%my_num_vars), &
-         my_state_loc(         ens_handle%my_num_vars), &
-         state_probit_trans_ok(ens_handle%my_num_vars))
+         my_state_loc(         ens_handle%my_num_vars))
 ! end alloc
 
 ! Initialize assim_tools_module if needed
@@ -415,9 +526,26 @@ if (.not. module_initialized) call assim_tools_init()
 ! Need to give create_mean_window the mean copy
 call create_mean_window(ens_handle, ENS_MEAN_COPY, distribute_mean)
 
-! Open the localization diagnostics file
-if(output_localization_diagnostics .and. my_task_id() == 0) &
+! filter kinds 1 and 8 return sorted increments, however non-deterministic
+! inflation can scramble these. the sort is expensive, so help users get better
+! performance by rejecting namelist combinations that do unneeded work.
+if (sort_obs_inc) then
+   if(deterministic_inflate(inflate) .and. ((filter_kind == 1) .or. (filter_kind == 8))) then
+      write(msgstring,  *) 'With a deterministic filter [assim_tools_nml:filter_kind = ',filter_kind,']'
+      write(msgstring2, *) 'and deterministic inflation [filter_nml:inf_deterministic = .TRUE.]'
+      write(msgstring3, *) 'assim_tools_nml:sort_obs_inc = .TRUE. is not needed and is expensive.'
+      call error_handler(E_MSG,'', '')  ! whitespace
+      call error_handler(E_MSG,'WARNING filter_assim:', msgstring, source, &
+                         text2=msgstring2,text3=msgstring3)
+      call error_handler(E_MSG,'', '')  ! whitespace
+      sort_obs_inc = .FALSE.
+   endif
+endif
+
+!GSR open the dignostics file
+if(output_localization_diagnostics .and. my_task_id() == 0) then
   localization_unit = open_file(localization_diagnostics_file, action = 'append')
+endif
 
 ! For performance, make local copies of these settings which
 ! are really in the inflate derived type.
@@ -479,6 +607,7 @@ call get_my_obs_loc(obs_ens_handle, obs_seq, keys, my_obs_loc, my_obs_kind, my_o
 
 if (convert_all_obs_verticals_first .and. is_doing_vertical_conversion) then
    ! convert the vertical of all my observations to the localization coordinate
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
    if (obs_ens_handle%my_num_vars > 0) then
       call convert_vertical_obs(ens_handle, obs_ens_handle%my_num_vars, my_obs_loc, &
                                 my_obs_kind, my_obs_type, get_vertical_localization_coord(), vstatus)
@@ -489,6 +618,7 @@ if (convert_all_obs_verticals_first .and. is_doing_vertical_conversion) then
          endif
       enddo
    endif 
+   if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'convert_vertical_obs')
 endif
 
 ! Get info on my number and indices for state
@@ -496,28 +626,27 @@ my_num_state = get_my_num_vars(ens_handle)
 call get_my_vars(ens_handle, my_state_indx)
 
 ! Get the location and kind of all my state variables
+if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
 do i = 1, ens_handle%my_num_vars
    call get_state_meta_data(my_state_indx(i), my_state_loc(i), my_state_kind(i))
-
-   ! Need to specify what kind of prior to use for each
-   call probit_dist_info(my_state_kind(i), .true., .false., dist_for_state, &
-      bounded_below, bounded_above, lower_bound, upper_bound)
-
-   ! Convert all my state variables to appropriate probit space
-   call transform_to_probit(ens_size, ens_handle%copies(1:ens_size, i), dist_for_state, &
-      state_dist_params(i), probit_ens, .false., &
-      bounded_below, bounded_above, lower_bound, upper_bound, ierr)
-   state_probit_trans_ok(i) = (ierr == 0)
-   if(state_probit_trans_ok(i)) ens_handle%copies(1:ens_size, i) = probit_ens
 end do
+if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'get_state_meta_data')
+
+!call test_get_state_meta_data(my_state_loc, ens_handle%my_num_vars)
 
 !> optionally convert all state location verticals
 if (convert_all_state_verticals_first .and. is_doing_vertical_conversion) then
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
    if (ens_handle%my_num_vars > 0) then
       call convert_vertical_state(ens_handle, ens_handle%my_num_vars, my_state_loc, my_state_kind,  &
                                   my_state_indx, get_vertical_localization_coord(), istatus)
    endif
+   if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'convert_vertical_state')
 endif
+
+! PAR: MIGHT BE BETTER TO HAVE ONE PE DEDICATED TO COMPUTING
+! INCREMENTS. OWNING PE WOULD SHIP IT'S PRIOR TO THIS ONE
+! BEFORE EACH INCREMENT.
 
 ! Get mean and variance of each group's observation priors for adaptive inflation
 ! Important that these be from before any observations have been used
@@ -530,26 +659,7 @@ if(local_ss_inflate) then
    end do
 endif
 
-! Have gotten the mean and variance from original ensembles, can convert all my obs to probit
-! CAN WE DO THE ADAPTIVE INFLATION ENTIRELY IN PROBIT SPACE TO MAKE IT DISTRIBUTION INDEPENDENT????
-! WOULD NEED AN OBSERVATION ERROR VARIANCE IN PROBIT SPACE SOMEHOW. IS THAT POSSIBLE???
-
-do i = 1, my_num_obs
-   obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, i)
-   ! Only do conversion of qc if forward operator is good
-   if(nint(obs_qc) == 0) then
-      ! Need to specify what kind of prior to use for each
-      call probit_dist_info(my_obs_kind(i), .false., .false., dist_for_obs, &
-         bounded_below, bounded_above, lower_bound, upper_bound)
-   
-      ! Convert all my obs (extended state) variables to appropriate probit space
-      call transform_to_probit(ens_size, obs_ens_handle%copies(1:ens_size, i), dist_for_obs, &
-         obs_dist_params(i), probit_ens, .false., &
-         bounded_below, bounded_above, lower_bound, upper_bound, ierr)
-      obs_probit_trans_ok(i) = (ierr == 0)
-      if(obs_probit_trans_ok(i)) obs_ens_handle%copies(1:ens_size, i) = probit_ens
-   endif
-end do
+! The computations in the two get_close_maxdist_init are redundant
 
 ! Initialize the method for getting state variables close to a given ob on my process
 if (has_special_cutoffs) then
@@ -565,6 +675,29 @@ else
    call get_close_init(gc_obs, my_num_obs, 2.0_r8*cutoff, my_obs_loc)
 endif
 
+! Set parameters for iterative PF updates
+filter_kind_orig = filter_kind
+
+if (filter_kind == 9) then
+
+  if (pf_enkf_hybrid) then
+     min_res = min_residual
+  else
+     min_res = 0.0_r8
+  end if
+
+! Set number of iterations for PF step
+  res = 1.0_r8 - min_res
+  res_y = 1.0_r8 - min_res
+  pf_infl = 1.0_r8
+
+  ! Add extra iteration for hybrid
+  maxiter = pf_maxiter + 1
+
+else
+   maxiter = 1
+end if
+
 if (close_obs_caching) then
    ! Initialize last obs and state get_close lookups, to take advantage below
    ! of sequential observations at the same location (e.g. U,V, possibly T,Q)
@@ -573,6 +706,10 @@ if (close_obs_caching) then
    last_base_states_loc        = set_location_missing()
    last_num_close_obs          = -1
    last_num_close_states       = -1
+   last_close_obs_ind(:)       = -1
+   last_close_state_ind(:)     = -1
+   last_close_obs_dist(:)      = 888888.0_r8   ! something big, not small
+   last_close_state_dist(:)    = 888888.0_r8   ! ditto
    num_close_obs_cached        = 0
    num_close_states_cached     = 0
    num_close_obs_calls_made    = 0
@@ -581,8 +718,338 @@ endif
 
 allow_missing_in_state = get_missing_ok_status()
 
-! Loop through all the (global) observations sequentially
-SEQUENTIAL_OBS: do i = 1, obs_ens_handle%num_vars
+! use MLOOP for the overall outer loop times; LG_GRN is for
+! sections inside the overall loop, including the total time
+! for the state_update and obs_update loops.  use SM_GRN for
+! sections inside those last 2 loops and be careful - they will
+! be called nobs * nstate * ntasks.
+
+
+! Main loop for iterative PF updates
+ITERATIONS: do iter = 1,maxiter
+
+  ens_init = ens_handle%copies(1:ens_size,:)
+  obs_ens_init = obs_ens_handle%copies(1:ens_size,:)
+
+  ! Initiate local PF arrays
+  if (filter_kind == 9) then
+
+   ! Need to store initial model space and observation space ensemble and initialize 
+   ! weights before observation loop. For now, store weights for each state variable. 
+   ! In the future, weights are needed only for each model grid point.
+   lw  = 0.0_r8
+   lhw = 0.0_r8
+   wp = 1.0_r8 / ens_size
+   beta = beta_max
+   beta_y = beta_max
+
+   ! Regularization strategy requires calculating the -log() of localized
+   ! obs-and model-space weights prior to DA step
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
+
+   if (use_externally_prescribed_pf_weights) then
+      write (debugfileunit, *) 'spam meeeeee'
+      open(kecd_file_unit, file="pyx_next.txt",access='sequential',form="formatted")
+      write (debugfileunit, *) 'trying to read the weights'
+      do kecd_ind = 1, 40
+         read(kecd_file_unit, *) kecd_offline_p_weights(kecd_ind, :)
+      end do
+      write (debugfileunit, *) 'we actually read the weights'
+      close(kecd_file_unit)
+   end if
+
+!!$   write (debugfileunit, *) kecd_offline_p_weights
+
+   REGULARIZATION: do i = 1, obs_ens_handle%num_vars
+
+      ! Every pe has information about the global obs sequence
+      call get_obs_from_key(obs_seq, keys(i), observation)
+      call get_obs_def(observation, obs_def)
+      base_obs_loc = get_obs_def_location(obs_def)
+      obs_err_var = get_obs_def_error_variance(obs_def)
+      base_obs_type = get_obs_def_type_of_obs(obs_def)
+      if (base_obs_type > 0) then
+         base_obs_kind = get_quantity_for_type_of_obs(base_obs_type)
+      else
+         call get_state_meta_data(-1 * int(base_obs_type,i8), dummyloc, base_obs_kind)
+      endif
+   
+      ! Get the value of the observation
+      call get_obs_values(observation, obs, obs_val_index)
+   
+      ! Find out who has this observation and where it is
+      call get_var_owner_index(ens_handle, int(i,i8), owner, owners_index)
+
+      ! Owner calculates weights for current ob
+      if(ens_handle%my_pe == owner) then
+   
+        obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
+
+
+        if(nint(obs_qc) == 0) then
+
+          ! Likelihood calculations
+!!$ ######################## change from here...
+
+          if (use_externally_prescribed_pf_weights) then
+        
+             hw = kecd_offline_p_weights(i, :)
+             hw = hw / sum(hw)
+
+          else
+
+             orig_obs_prior = obs_ens_init(1:ens_size, owners_index)
+             d = (obs(1) - orig_obs_prior)**2 / (2.0_r8*obs_err_var) ! actual (part of) likelihood
+             d = d - minval(d) ! helps w round off
+
+             hw = exp( -d ) ! this is where im gonna slot my stuff in
+             hw = hw / sum(hw)
+
+          end if
+          
+          neg_log_weights = -log(hw)
+
+!!$          write(debugfileunit, *) "hw kecd (from text file, normalized)"
+!!$          write(debugfileunit, *) hw
+
+!!$ ######################## to here...
+          ! Determine whether to skip ob
+          if (1.0_r8 > ens_size * 0.98_r8 *sum(hw**2) ) then
+            ! write(*,*) 'Skipping with Neff =',1.0_r8 / sum(hw**2)
+            obs_qc = 1
+            obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index) = 1
+          else
+
+            temp1 = max( 1.0_r8, maxval(neg_log_weights)/80.0_r8 )
+            call pf_regularization_minw(neg_log_weights/temp1, 1E-10_r8 / ens_size, ens_size, obs_err_infl)
+
+            pf_infl(owners_index) = obs_err_infl*temp1
+
+            ! q: how do 
+            hw = exp( -neg_log_weights/pf_infl(owners_index) )
+            hw = hw / sum(hw)
+
+            ! Save inflation and weights
+            wp(1:ens_size,owners_index) = hw
+          end if
+
+        end if
+
+        call broadcast_send(map_pe_to_task(ens_handle, owner), hw, scalar1=obs_qc)
+
+      else
+
+         call broadcast_recv(map_pe_to_task(ens_handle, owner), hw, scalar1=obs_qc)
+
+      end if
+
+      ! Skip ob if flagged by qc
+      if(nint(obs_qc) /= 0) cycle REGULARIZATION
+
+      ! Get localization coefficients for nearby obs- and model-space priors
+      if (.not. close_obs_caching) then
+         call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
+                            my_obs_loc, my_obs_kind, my_obs_type, &
+                            num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+      else
+ 
+         if (base_obs_loc == last_base_obs_loc) then
+            num_close_obs     = last_num_close_obs
+            close_obs_ind(:)  = last_close_obs_ind(:)
+            close_obs_dist(:) = last_close_obs_dist(:)
+            num_close_obs_cached = num_close_obs_cached + 1
+         else
+            call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
+                               my_obs_loc, my_obs_kind, my_obs_type, &
+                               num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+            last_base_obs_loc      = base_obs_loc
+            last_num_close_obs     = num_close_obs
+            last_close_obs_ind(:)  = close_obs_ind(:)
+            last_close_obs_dist(:) = close_obs_dist(:)
+            num_close_obs_calls_made = num_close_obs_calls_made +1
+         endif
+      endif
+
+      if (base_obs_type > 0) then
+         cutoff_orig = cutoff_list(base_obs_type)
+      else
+         cutoff_orig = cutoff
+      endif
+
+      cutoff_rev = cutoff_orig
+
+      if (.not. close_obs_caching) then
+         call get_close_state(gc_state, base_obs_loc, base_obs_type, &
+                              my_state_loc, my_state_kind, my_state_indx, &
+                              num_close_states, close_state_ind, close_state_dist, ens_handle)
+      else
+         if (base_obs_loc == last_base_states_loc) then
+            num_close_states    = last_num_close_states
+            close_state_ind(:)  = last_close_state_ind(:)
+            close_state_dist(:) = last_close_state_dist(:)
+            num_close_states_cached = num_close_states_cached + 1
+         else
+            call get_close_state(gc_state, base_obs_loc, base_obs_type, &
+                                 my_state_loc, my_state_kind, my_state_indx, &
+                                 num_close_states, close_state_ind, close_state_dist, ens_handle)
+            last_base_states_loc     = base_obs_loc
+            last_num_close_states    = num_close_states
+            last_close_state_ind(:)  = close_state_ind(:)
+            last_close_state_dist(:) = close_state_dist(:)
+            num_close_states_calls_made = num_close_states_calls_made + 1 
+         endif
+      endif
+
+      ! Redundant part of weight calculation
+      wt = ens_size*hw - 1.0_r8
+
+      ! Calculate logw for prior states that are potentially close
+      STATE_WEIGHTS: do j = 1, num_close_states
+         state_index = close_state_ind(j)
+
+         ! the "any" is an expensive test when you do it for every ob.  don't test
+         ! if we know there aren't going to be missing values in the state.
+         if ( allow_missing_in_state ) then
+            ! Some models can take evasive action if one or more of the ensembles have
+            ! a missing value. Generally means 'do nothing' (as opposed to DIE)
+            if (any(ens_handle%copies(1:ens_size, state_index) == MISSING_R8)) cycle STATE_WEIGHTS
+         endif
+     
+         ! Compute the distance and covariance factor 
+         cov_factor = comp_cov_factor(close_state_dist(j), cutoff_rev, &
+            base_obs_loc, base_obs_type, my_state_loc(state_index), my_state_kind(state_index))
+
+         ! Update only when prior variance is not zero
+         if ( maxval( ens_handle%copies(1:ens_size, state_index)) /= &
+              minval( ens_handle%copies(1:ens_size, state_index)) ) then
+
+            ! Take running sum of -log() of weights
+            if (cov_factor == 1.0_r8) then
+              d = log(ens_size*hw)
+            else
+              d = wt*cov_factor
+              do n = 1,ens_size
+                if (abs(d(n)) > 0.1_r8) then
+                  d(n) = log( d(n) + 1.0_r8 )
+                end if
+              end do
+            end if
+            lw(1:ens_size,state_index) = lw(1:ens_size,state_index) - d
+            lw(1:ens_size,state_index) = lw(1:ens_size,state_index) - minval(lw(1:ens_size,state_index))
+
+         end if 
+
+      end do STATE_WEIGHTS
+
+      ! Calculate logw for prior obs-space states that are potentially close
+      OBS_WEIGHTS: do j = 1, num_close_obs
+         obs_index = close_obs_ind(j)
+
+         ! If the forward observation operator failed, no need to 
+         ! update the unassimilated observations 
+         if (any(obs_ens_handle%copies(1:ens_size, obs_index) == MISSING_R8)) cycle OBS_WEIGHTS
+
+         ! Compute the distance and the covar_factor
+         cov_factor = comp_cov_factor(close_obs_dist(j), cutoff_rev, &
+            base_obs_loc, base_obs_type, my_obs_loc(obs_index), my_obs_kind(obs_index))
+
+         ! Update only when prior variance is not zero
+         if ( maxval( obs_ens_handle%copies(1:ens_size, obs_index)) /= &
+              minval( obs_ens_handle%copies(1:ens_size, obs_index)) ) then
+
+            ! Take running sum of -log() of weights
+            if (cov_factor == 1.0_r8) then
+              d = log(ens_size*hw)
+            else
+              d = wt*cov_factor
+              do n = 1,ens_size
+                if (abs(d(n)) > 0.1_r8) then
+                  d(n) = log( d(n) + 1.0_r8 )
+                end if
+              end do
+            end if
+            lhw(1:ens_size,obs_index) = lhw(1:ens_size,obs_index) - d
+            lhw(1:ens_size,obs_index) = lhw(1:ens_size,obs_index) - minval(lhw(1:ens_size,obs_index))
+         end if  
+
+      end do OBS_WEIGHTS
+
+   end do REGULARIZATION
+
+
+   ! Calculate model-space regularization coefficients 
+   max_res = 0.0_r8
+   do i = 1,ens_handle%my_num_vars
+
+      if ( (res(i) > 0.0_r8) ) then
+
+         call pf_regularization(lw(1:ens_size,i),ens_size,frac_neff*ens_size,beta(i),beta_max)
+
+         ! Fix beta if its inverse exceeds residual
+         if (res(i) <= 1.0_r8/beta(i)) then
+            beta(i) = 1.0_r8/res(i)
+            res(i) = 0.0_r8
+         else
+            res(i) = res(i) - 1.0_r8/beta(i)
+         end if
+
+         ! Store residuals
+         beta(i) = min(beta(i),beta_max)
+         max_res = max(res(i),max_res)
+
+      else
+
+         beta(i) = beta_max
+
+      end if
+
+   end do
+
+   ! Calculate obs-space regularization coefficients 
+   do i = 1,obs_ens_handle%my_num_vars
+
+      obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY,i)
+
+      if ( (res_y(i) > 0.0_r8) .and. (nint(obs_qc) == 0) ) then
+
+         call pf_regularization(lhw(1:ens_size,i),ens_size,frac_neff*ens_size,beta_y(i),beta_max)
+
+         ! Fix beta if its inverse exceeds residual
+         if (res_y(i) <= 1.0_r8/beta_y(i)) then
+            beta_y(i) = 1.0_r8/res_y(i)
+            res_y(i) = 0.0_r8
+         else
+            res_y(i) = res_y(i) - 1.0_r8/beta_y(i)
+         end if
+
+         ! Store residuals
+         beta_y(i) = min(beta_y(i),beta_max)
+
+      else
+
+         beta_y(i) = beta_max
+
+      end if
+
+   end do
+
+   call get_global_max(max_res)
+
+   if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'regularization')
+
+   ! Reset -log() weights to zero for sequential update step
+   lw  = 0.0_r8
+   lhw = 0.0_r8
+
+  end if  ! local PF
+
+
+  ! Loop through all the (global) observations sequentially
+  SEQUENTIAL_OBS: do i = 1, obs_ens_handle%num_vars
+
+   if (timing(MLOOP))  call start_timer(t_base(MLOOP))
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
+
    ! Some compilers do not like mod by 0, so test first.
    if (print_every_nth_obs > 0) nth_obs = mod(i, print_every_nth_obs)
 
@@ -632,119 +1099,289 @@ SEQUENTIAL_OBS: do i = 1, obs_ens_handle%num_vars
 
       obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
 
+      ! Inflate obs error variance for EnKF step in hybrid
+      if (filter_kind == 1 .and. iter > 1) then
+         obs_err_infl = 1.0_r8 / min_res
+         obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
+         obs_err_var = obs_err_var*obs_err_infl
+         if ( obs_err_infl > 500 ) obs_qc = 1
+      end if
+
       ! Only value of 0 for DART QC field should be assimilated
-      IF_QC_IS_OKAY: if(nint(obs_qc) ==0) then
-         ! Note that these are before DA starts, so can be different from current obs_prior
-         orig_obs_prior_mean = obs_ens_handle%copies(OBS_PRIOR_MEAN_START: &
-            OBS_PRIOR_MEAN_END, owners_index)
-         orig_obs_prior_var  = obs_ens_handle%copies(OBS_PRIOR_VAR_START:  &
-            OBS_PRIOR_VAR_END, owners_index)
+      IF_QC_IS_OKAY: if(nint(obs_qc) == 0) then
 
-         ! Convert this observation ensemble from probit back to regular space if to_probit was successful
-         if(obs_probit_trans_ok(owners_index)) then 
-            call transform_from_probit(ens_size, obs_ens_handle%copies(1:ens_size, owners_index) , &
-               obs_dist_params(owners_index), obs_ens_handle%copies(1:ens_size, owners_index))
-         endif
+        obs_prior = obs_ens_handle%copies(1:ens_size, owners_index)
 
-         obs_prior = obs_ens_handle%copies(1:ens_size, owners_index)
+        ! Get current PF obs-space weights
+        if (filter_kind == 9) then
+
+          ! Prior for current ob
+          if (sampling_weighted_prior) then
+            obs_prior = obs_ens_init(1:ens_size, owners_index)
+          end if
+
+          ! Contribution of current ob for vector weight calculations
+          hw = wp(1:ens_size, owners_index)
+
+          ! Obs-space weights used for sampling
+          if (sampling_weighted_prior) then
+
+            w = lhw(1:ens_size,owners_index) - log( ens_size*hw )
+            w = w - minval(w)
+            w = exp( - w / beta_y(owners_index) )
+            w = w / sum(w)
+
+          else
+
+            ! Obs error inflation 
+            obs_err_infl = pf_infl(owners_index)*beta_y(owners_index)
+
+            ! Scalar weights for resampling particles
+            d = (obs(1) - obs_prior)**2 / (2.0_r8*obs_err_var*obs_err_infl)
+            w = exp( -d )
+            if ( sum(w) == 0.0_r8 ) then
+              n = minloc(d, 1, mask=d.gt.0)
+              w(n) = 1.0_r8
+            end if
+            w = w / sum(w)
+
+          end if
+
+          if (sampling_weighted_prior) then
+            ws = 1.0_r8 / 2.0_r8
+            w = w**ws
+            w = w / sum(w)
+          end if
+
+          ! Compute obs space prior information for adaptive inflation
+          if(local_varying_ss_inflate) then
+             orig_obs_prior_mean = obs_ens_handle%copies(OBS_PRIOR_MEAN_START: &
+                OBS_PRIOR_MEAN_END, owners_index)
+             orig_obs_prior_var  = obs_ens_handle%copies(OBS_PRIOR_VAR_START:  &
+                OBS_PRIOR_VAR_END, owners_index)
+          endif
+
+        else
+
+          ! Compute the prior mean and variance for this observation
+          orig_obs_prior_mean = obs_ens_handle%copies(OBS_PRIOR_MEAN_START: &
+             OBS_PRIOR_MEAN_END, owners_index)
+
+          orig_obs_prior_var  = obs_ens_handle%copies(OBS_PRIOR_VAR_START:  &
+             OBS_PRIOR_VAR_END, owners_index)
+
+          ! Compute observation space increments for each group
+          do group = 1, num_groups
+             grp_bot = grp_beg(group)
+             grp_top = grp_end(group)
+             call obs_increment(obs_prior(grp_bot:grp_top), grp_size, obs(1), &
+                obs_err_var, obs_inc(grp_bot:grp_top), inflate, my_inflate,   &
+                my_inflate_sd, net_a(group))
+          end do
+
+        endif
+
+        ! Compute updated values for single state space inflation
+        SINGLE_SS_INFLATE: if(local_single_ss_inflate) then
+           ss_inflate_base = ens_handle%copies(ENS_SD_COPY, 1)
+           ! Update for each group separately
+           do group = 1, num_groups
+             ! If either inflation or sd is not positive, not really doing inflation
+             if(my_inflate > 0.0_r8 .and. my_inflate_sd > 0.0_r8) then
+                 ! For case with single spatial inflation, use gamma = 1.0_r8
+                  ! See adaptive inflation module for details
+                  gamma = 1.0_r8
+                  ! Deflate the inflated variance; required for efficient single pass
+                  ! This is one of many places that assumes linear state/obs relation
+                  ! over range of ensemble; Essentially, we are removing the inflation
+                  ! which has already been applied in filter to see what inflation should
+                  ! have been needed.
+                  ens_obs_mean = orig_obs_prior_mean(group)
+                  ens_obs_var = orig_obs_prior_var(group)
+                  ! gamma is hardcoded as 1.0, so no test is needed here.
+                  ens_var_deflate = ens_obs_var / &
+                     (1.0_r8 + gamma*(sqrt(ss_inflate_base) - 1.0_r8))**2
+
+                  ! If this is inflate_only (i.e. posterior) remove impact of this obs.
+                  ! This is simulating independent observation by removing its impact.
+                  if(inflate_only .and. &
+                        ens_var_deflate               > small .and. &
+                        obs_err_var                   > small .and. &
+                        obs_err_var - ens_var_deflate > small ) then
+                     r_var = 1.0_r8 / (1.0_r8 / ens_var_deflate - 1.0_r8 / obs_err_var)
+                     r_mean = r_var *(ens_obs_mean / ens_var_deflate - obs(1) / obs_err_var)
+                  else
+                     r_var = ens_var_deflate
+                     r_mean = ens_obs_mean
+                  endif
+
+                  if (timing(SM_GRN)) call start_timer(t_base(SM_GRN), t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+                  ! Update the inflation value
+                  call update_inflation(inflate, my_inflate, my_inflate_sd, &
+                     r_mean, r_var, grp_size, obs(1), obs_err_var, gamma)
+                  if (timing(SM_GRN)) call read_timer(t_base(SM_GRN), 'update_inflation_C', &
+                                                      t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+               endif
+            end do
+         endif SINGLE_SS_INFLATE
+
       endif IF_QC_IS_OKAY
 
       !Broadcast the info from this obs to all other processes
-      ! orig_obs_prior_mean and orig_obs_prior_var only used with adaptive inflation
-      ! my_inflate and my_inflate_sd only used with single state space inflation
-      ! vertvalue_obs_in_localization_coord and whichvert_real only used for vertical
-      ! coordinate transformation
+      ! What gets broadcast depends on what kind of inflation is being done
+      !>@todo it should also depend on if vertical is being converted.  the last
+      !>two values aren't needed unless vertical conversion is happening.
+      !>@todo FIXME: this is messy, but should we have 6 different broadcasts,
+      !>the three below and three more which omit the 2 localization values?
+      !>how much does this cost in time? time this and see.
       whichvert_real = real(whichvert_obs_in_localization_coord, r8)
-      call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior,    &
-         orig_obs_prior_mean, orig_obs_prior_var,                          &
-         scalar1=obs_qc, scalar2=vertvalue_obs_in_localization_coord,      &
-         scalar3=whichvert_real, scalar4=my_inflate, scalar5=my_inflate_sd)
+
+      if (filter_kind == 9) then
+
+         if(local_varying_ss_inflate) then
+            call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior, &
+               orig_obs_prior_mean, orig_obs_prior_var, w, hw, scalar1=obs_qc, &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         else
+            call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior, w, hw, scalar1=obs_qc, &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         endif
+
+      else
+
+         if(local_varying_ss_inflate) then
+            call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+               orig_obs_prior_mean, orig_obs_prior_var, net_a, scalar1=obs_qc, &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         else if(local_single_ss_inflate .or. local_obs_inflate) then
+            call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+              net_a, scalar1=my_inflate, scalar2=my_inflate_sd, scalar3=obs_qc, &
+              scalar4=vertvalue_obs_in_localization_coord, scalar5=whichvert_real)
+         else
+            call broadcast_send(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+              net_a, scalar1=obs_qc, &
+              scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         endif
+
+      endif
 
    ! Next block is done by processes that do NOT own this observation
    !-----------------------------------------------------------------------
    else
-      call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior,    &
-         orig_obs_prior_mean, orig_obs_prior_var,                          & 
-         scalar1=obs_qc, scalar2=vertvalue_obs_in_localization_coord,      &
-         scalar3=whichvert_real, scalar4=my_inflate, scalar5=my_inflate_sd)
+      ! I don't store this obs; receive the obs prior and increment from broadcast
+      ! Also get qc and inflation information if needed
+      ! also a converted vertical coordinate if needed
+      !>@todo FIXME see the comment in the broadcast_send() section about
+      !>the cost of sending unneeded values
+
+      ! PF needs to broadcast different variables than other filters 
+      if (filter_kind == 9) then
+
+         if(local_varying_ss_inflate) then
+            call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, &
+               orig_obs_prior_mean, orig_obs_prior_var, w, hw, scalar1=obs_qc,  &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         else
+            call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, w, hw, scalar1=obs_qc, &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         endif
+      else
+         if(local_varying_ss_inflate) then
+            call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+               orig_obs_prior_mean, orig_obs_prior_var, net_a, scalar1=obs_qc, &
+               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         else if(local_single_ss_inflate .or. local_obs_inflate) then
+            call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+               net_a, scalar1=my_inflate, scalar2=my_inflate_sd, scalar3=obs_qc, &
+               scalar4=vertvalue_obs_in_localization_coord, scalar5=whichvert_real)
+         else
+            call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
+              net_a, scalar1=obs_qc, &
+              scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+         endif
+      endif
       whichvert_obs_in_localization_coord = nint(whichvert_real)
 
    endif
    !-----------------------------------------------------------------------
 
    ! Everybody is doing this section, cycle if qc is bad
-   if(nint(obs_qc) /= 0) cycle SEQUENTIAL_OBS
-
+   if(nint(obs_qc) /= 0) then
+      if (timing(MLOOP)) then
+         write(msgstring, '(A32,I7)') 'sequential obs cycl: obs', keys(i)
+         call read_timer(t_base(MLOOP), msgstring, elapsed = elapse_array(i))
+      endif
+      cycle SEQUENTIAL_OBS
+   endif
+   
    !> all tasks must set the converted vertical values into the 'base' version of this loc
    !> because that's what we pass into the get_close_xxx() routines below.
    if (is_doing_vertical_conversion) &
       call set_vertical(base_obs_loc, vertvalue_obs_in_localization_coord, whichvert_obs_in_localization_coord)
+   
+   ! Skip for PF
+   if (filter_kind /= 9) then
 
-   ! Compute observation space increments for each group
-   do group = 1, num_groups
-      grp_bot = grp_beg(group); grp_top = grp_end(group)
-      call obs_increment(obs_prior(grp_bot:grp_top), grp_size, obs(1), &
-         obs_err_var, base_obs_kind, obs_inc(grp_bot:grp_top), inflate, my_inflate,   &
-         my_inflate_sd, net_a(group))
-      obs_post(grp_bot:grp_top) = obs_prior(grp_bot:grp_top) + obs_inc(grp_bot:grp_top)
-
-      ! Convert both the prior and posterior to probit space (efficiency for prior???)
-      ! Running probit space with groups needs to be studied more carefully
-      ! EFFICIENCY NOTE: FOR RHF, THE OBS_INCREMENT HAS TO DO A SORT
-      ! THE POSTERIOR WOULD HAVE THE SAME RANK STATISTICS, SO THIS SORT WOULD BE THE SAME
-      ! THE SECOND CONVERT_TO_PROBIT CAN BE MUCH MORE EFFICIENT USING A SORT
-      ! SHOULD FIGURE OUT A WAY TO PASS THE SORT ORDER
-      ! NOTE 2: THIS CONVERSION IS USING THE INFO FROM THE CURRENT (UPDATED) PRIOR ENSEMBLE. THIS
-      ! IS GENERALLY GOING TO BE A DIFFERENT PROBIT TRANSFORMED ENSEMBLE THAN THE ONE THAT WAS JUST
-      ! CONVERTED FROM PROBIT SPACE BY THE PROCESS THAT OWNS THIS OBSERVATION. 
-
-      ! Need to specify what kind of prior to use for obs being assimilated
-      call probit_dist_info(base_obs_kind, .false., .false., dist_for_obs, &
-         bounded_below, bounded_above, lower_bound, upper_bound)
-
-      ! Convert the prior and posterior for this observation to probit space
-      call transform_to_probit(grp_size, obs_prior(grp_bot:grp_top), dist_for_obs, &
-         temp_dist_params, probit_obs_prior(grp_bot:grp_top), .false., &
-         bounded_below, bounded_above, lower_bound, upper_bound, ierr)
-      ! If probit transform fails for any group, this observation cannot be assimimlated
-      if(ierr /= 0) cycle SEQUENTIAL_OBS
-      call transform_to_probit(grp_size, obs_post(grp_bot:grp_top), dist_for_obs, &
-         temp_dist_params, probit_obs_post(grp_bot:grp_top), .true., &
-         bounded_below, bounded_above, lower_bound, upper_bound, ierr)
-      ! If probit transform fails for any group, this observation cannot be assimimlated
-      if(ierr /= 0) cycle SEQUENTIAL_OBS
-      ! Free up the storage used for this transform
-      call deallocate_distribution_params(temp_dist_params)
-
-      ! Copy back into original storage
-      obs_prior(grp_bot:grp_top) = probit_obs_prior(grp_bot:grp_top)
-      obs_post(grp_bot:grp_top) = probit_obs_post(grp_bot:grp_top)
-      ! Recompute obs_inc in probit space
-      obs_inc(grp_bot:grp_top) = obs_post(grp_bot:grp_top) - obs_prior(grp_bot:grp_top)
-
-      ! Also compute prior mean and variance of obs for efficiency here
-      obs_prior_mean(group) = sum(obs_prior(grp_bot:grp_top)) / grp_size
-      obs_prior_var(group) = sum((obs_prior(grp_bot:grp_top) - obs_prior_mean(group))**2) / &
-         (grp_size - 1)
-      if (obs_prior_var(group) < 0.0_r8) obs_prior_var(group) = 0.0_r8
-   end do
-
-   ! Compute updated values for single state space inflation
-   if(local_single_ss_inflate) then
-      ! Update for each group separately
+      ! Can compute prior mean and variance of obs for each group just once here
       do group = 1, num_groups
-         call update_single_state_space_inflation(inflate, my_inflate, my_inflate_sd, &
-            ens_handle%copies(ENS_SD_COPY, 1), orig_obs_prior_mean(group), &
-            orig_obs_prior_var(group), obs(1), obs_err_var, grp_size, inflate_only)
+         grp_bot = grp_beg(group)
+         grp_top = grp_end(group)
+         obs_prior_mean(group) = sum(obs_prior(grp_bot:grp_top)) / grp_size
+         obs_prior_var(group) = sum((obs_prior(grp_bot:grp_top) - obs_prior_mean(group))**2) / &
+            (grp_size - 1)
+         if (obs_prior_var(group) < 0.0_r8) obs_prior_var(group) = 0.0_r8
       end do
+
    endif
-  
-   ! Adaptive localization needs number of other observations within localization radius.
-   ! Do get_close_obs first, even though state space increments are computed before obs increments.
-   call  get_close_obs_cached(gc_obs, base_obs_loc, base_obs_type,      &
-      my_obs_loc, my_obs_kind, my_obs_type, num_close_obs, close_obs_ind, close_obs_dist,  &
-      ens_handle, last_base_obs_loc, last_num_close_obs, num_close_obs_cached,             &
-      num_close_obs_calls_made)
+
+   ! If we are doing adaptive localization then we need to know the number of
+   ! other observations that are within the localization radius.  We may need
+   ! to shrink it, and so we need to know this before doing get_close() for the
+   ! state space (even though the state space increments will be computed and
+   ! applied first).
+
+   !******************************************
+
+
+   if (.not. close_obs_caching) then
+      if (timing(GC)) call start_timer(t_base(GC), t_items(GC), t_limit(GC), do_sync=.false.)
+      call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
+                         my_obs_loc, my_obs_kind, my_obs_type, &
+                         num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+      if (timing(GC)) then
+         write(msgstring, '(A32,3I7)') 'gc_ob_NC:nobs,tot,obs# ', num_close_obs, obs_ens_handle%my_num_vars, keys(i)
+         call read_timer(t_base(GC), msgstring, t_items(GC), t_limit(GC), do_sync=.false.)
+      endif
+
+   else
+
+      if (base_obs_loc == last_base_obs_loc) then
+         num_close_obs     = last_num_close_obs
+         close_obs_ind(:)  = last_close_obs_ind(:)
+         close_obs_dist(:) = last_close_obs_dist(:)
+         num_close_obs_cached = num_close_obs_cached + 1
+      else
+         if (timing(GC)) call start_timer(t_base(GC), t_items(GC), t_limit(GC), do_sync=.false.)
+         call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
+                            my_obs_loc, my_obs_kind, my_obs_type, &
+                            num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+         if (timing(GC)) then
+            write(msgstring, '(A32,3I7)') 'gc_ob_C: nobs,tot,obs# ', num_close_obs, obs_ens_handle%my_num_vars, keys(i)
+            call read_timer(t_base(GC), msgstring, t_items(GC), t_limit(GC), do_sync=.false.)
+         endif
+
+         last_base_obs_loc      = base_obs_loc
+         last_num_close_obs     = num_close_obs
+         last_close_obs_ind(:)  = close_obs_ind(:)
+         last_close_obs_dist(:) = close_obs_dist(:)
+         num_close_obs_calls_made = num_close_obs_calls_made +1
+      endif
+   endif
+
+   n_close_obs_items(i) = num_close_obs
+    !print*, 'base_obs _oc', base_obs_loc, 'rank ', my_task_id()
+    !call test_close_obs_dist(close_obs_dist, num_close_obs, i)
+    !print*, 'num close ', num_close_obs
 
    ! set the cutoff default, keep a copy of the original value, and avoid
    ! looking up the cutoff in a list if the incoming obs is an identity ob
@@ -756,88 +1393,663 @@ SEQUENTIAL_OBS: do i = 1, obs_ens_handle%num_vars
       cutoff_orig = cutoff
    endif
 
-   ! JLA, could also cache for adaptive_localization which may be expensive?
-   call adaptive_localization_and_diags(cutoff_orig, cutoff_rev, adaptive_localization_threshold, &
-      adaptive_cutoff_floor, num_close_obs, close_obs_ind, close_obs_dist, my_obs_type, &
-      i, base_obs_loc, obs_def, localization_unit)
+   cutoff_rev = cutoff_orig
 
+   ! For adaptive localization, need number of other obs close to the chosen observation
+   if(adaptive_localization_threshold > 0) then
+
+      if (timing(GC)) call start_timer(t_base(GC), t_items(GC), t_limit(GC), do_sync=.false.)
+
+      ! this does a cross-task sum, so all tasks must make this call.
+      total_num_close_obs = count_close(num_close_obs, close_obs_ind, my_obs_type, &
+                                        close_obs_dist, cutoff_rev*2.0_r8)
+      if (timing(GC)) call read_timer(t_base(GC), 'count_close', t_items(GC), t_limit(GC), do_sync=.false.)
+
+
+      ! Want expected number of close observations to be reduced to some threshold;
+      ! accomplish this by cutting the size of the cutoff distance.
+      if(total_num_close_obs > adaptive_localization_threshold) then
+
+         cutoff_rev = revised_distance(cutoff_rev*2.0_r8, adaptive_localization_threshold, &
+                                       total_num_close_obs, base_obs_loc, &
+                                       adaptive_cutoff_floor*2.0_r8) / 2.0_r8
+
+         if ( output_localization_diagnostics ) then
+
+            ! to really know how many obs are left now, you have to
+            ! loop over all the obs, again, count how many kinds are
+            ! going to be assim, and explicitly check the distance and
+            ! see if it's closer than the new cutoff ( times 2 ), and
+            ! then do a global sum to get the total.  since this costs,
+            ! do it only when diagnostics are requested.
+
+            ! this does a cross-task sum, so all tasks must make this call.
+            rev_num_close_obs = count_close(num_close_obs, close_obs_ind, my_obs_type, &
+                                              close_obs_dist, cutoff_rev*2.0_r8)
+
+
+            ! GSR output the new cutoff
+            ! Here is what we might want:
+            ! time, ob index #, ob location, new cutoff, the assimilate obs count, owner (which process has this ob)
+            ! obs_time, obs_val_index, base_obs_loc, cutoff_rev, total_num_close_obs, owner
+            ! break up the time into secs and days, and break up the location into lat, lon and height
+            ! nsc - the min info here that can't be extracted from the obs key is:
+            !  key (obs#), total_num_close_obs (close w/ original cutoff), revised cutoff & new count
+            if (my_task_id() == 0) then
+               call get_obs_def(observation, obs_def)
+               this_obs_time = get_obs_def_time(obs_def)
+               call get_time(this_obs_time,secs,days)
+               call write_location(-1, base_obs_loc, charstring=base_loc_text)
+
+               write(localization_unit,'(i12,1x,i5,1x,i8,1x,A,2(f14.5,1x,i12))') i, secs, days, &
+                     trim(base_loc_text), cutoff_orig, total_num_close_obs, cutoff_rev, rev_num_close_obs
+            endif
+         endif
+
+      endif
+
+   else if (output_localization_diagnostics) then
+
+      ! if you aren't adapting but you still want to know how many obs are within the
+      ! localization radius, set the diag output.  this could be large, use carefully.
+
+      ! this does a cross-task sum, so all tasks must make this call.
+      total_num_close_obs = count_close(num_close_obs, close_obs_ind, my_obs_type, &
+                                        close_obs_dist, cutoff_rev*2.0_r8)
+
+      if (my_task_id() == 0) then
+         call get_obs_def(observation, obs_def)
+         this_obs_time = get_obs_def_time(obs_def)
+         call get_time(this_obs_time,secs,days)
+         call write_location(-1, base_obs_loc, charstring=base_loc_text)
+
+         write(localization_unit,'(i12,1x,i5,1x,i8,1x,A,f14.5,1x,i12)') i, secs, days, &
+               trim(base_loc_text), cutoff_rev, total_num_close_obs
+      endif
+   endif
+
+   ! Now everybody updates their close states
    ! Find state variables on my process that are close to observation being assimilated
-   call  get_close_state_cached(gc_state, base_obs_loc, base_obs_type,      &
-      my_state_loc, my_state_kind, my_state_indx, num_close_states, close_state_ind, close_state_dist,  &
-      ens_handle, last_base_states_loc, last_num_close_states, num_close_states_cached,              &
-      num_close_states_calls_made)
+   if (.not. close_obs_caching) then
+      if (timing(GC)) call start_timer(t_base(GC), t_items(GC), t_limit(GC), do_sync=.false.)
+      call get_close_state(gc_state, base_obs_loc, base_obs_type, &
+                           my_state_loc, my_state_kind, my_state_indx, &
+                           num_close_states, close_state_ind, close_state_dist, ens_handle)
+      if (timing(GC)) then
+         write(msgstring, '(A32,3I7)') 'gc_st_NC:nsts,tot,obs# ', num_close_states, ens_handle%my_num_vars, keys(i)
+         call read_timer(t_base(GC), msgstring, t_items(GC), t_limit(GC), do_sync=.false.)
+      endif
+   else
+      if (base_obs_loc == last_base_states_loc) then
+         num_close_states    = last_num_close_states
+         close_state_ind(:)  = last_close_state_ind(:)
+         close_state_dist(:) = last_close_state_dist(:)
+         num_close_states_cached = num_close_states_cached + 1
+      else
+         if (timing(GC)) call start_timer(t_base(GC), t_items(GC), t_limit(GC), do_sync=.false.)
+         call get_close_state(gc_state, base_obs_loc, base_obs_type, &
+                              my_state_loc, my_state_kind, my_state_indx, &
+                              num_close_states, close_state_ind, close_state_dist, ens_handle)
+         if (timing(GC)) then
+            write(msgstring, '(A32,3I7)') 'gc_st_C: nsts,tot,obs# ', num_close_states, ens_handle%my_num_vars, keys(i)
+            call read_timer(t_base(GC), msgstring, t_items(GC), t_limit(GC), do_sync=.false.)
+         endif
+
+         last_base_states_loc     = base_obs_loc
+         last_num_close_states    = num_close_states
+         last_close_state_ind(:)  = close_state_ind(:)
+         last_close_state_dist(:) = close_state_dist(:)
+         num_close_states_calls_made = num_close_states_calls_made + 1
+      endif
+   endif
+
+   n_close_state_items(i) = num_close_states
+   !print*, 'num close state', num_close_states
    !call test_close_obs_dist(close_state_dist, num_close_states, i)
+   !call test_state_copies(ens_handle, 'beforeupdates')
+
+   if (timing(LG_GRN)) then
+      write(msgstring, '(A32,I7)') 'before_state_update: obs', keys(i)
+      call read_timer(t_base(LG_GRN), msgstring)
+   endif
+
+
+   if (filter_kind == 9) then
+
+     ! Skip update step if weights at ob location are uniform
+     if (1.0_r8 > 0.98_r8*ens_size*sum(w**2) ) then
+       cycle SEQUENTIAL_OBS
+     end if
+
+     ! Get sampling indices
+     call pf_sample(obs_prior, w(1:ens_size), ens_size, indx(1:ens_size))
+
+     ! Redundant part of weight calculation   
+     wt = ens_size*hw - 1.0_r8
+
+   endif
 
    ! Loop through to update each of my state variables that is potentially close
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
    STATE_UPDATE: do j = 1, num_close_states
       state_index = close_state_ind(j)
 
-      ! If transform to probit failed for this state variable, don't update it
-      if(.not. state_probit_trans_ok(state_index)) cycle STATE_UPDATE
+      ! Skip if regularization reaches threashold value 
+      if (filter_kind == 9) then
+         if ( beta(state_index) == beta_max ) cycle STATE_UPDATE
+      end if
 
+      ! the "any" is an expensive test when you do it for every ob.  don't test
+      ! if we know there aren't going to be missing values in the state.
       if ( allow_missing_in_state ) then
-         ! Don't allow update of state ensemble with any missing values
+         ! Some models can take evasive action if one or more of the ensembles have
+         ! a missing value. Generally means 'do nothing' (as opposed to DIE)
          if (any(ens_handle%copies(1:ens_size, state_index) == MISSING_R8)) cycle STATE_UPDATE
       endif
 
-      ! Compute the covariance localization and adjust_obs_impact factors (module storage)
-      final_factor = cov_and_impact_factors(base_obs_loc, base_obs_type, my_state_loc(state_index), &
-         my_state_kind(state_index), close_state_dist(j), cutoff_rev)
+      ! Get the initial values of inflation for this variable if state varying inflation
+      if(local_varying_ss_inflate .and. filter_kind /= 9) then
+         varying_ss_inflate    = ens_handle%copies(ENS_INF_COPY,    state_index)
+         varying_ss_inflate_sd = ens_handle%copies(ENS_INF_SD_COPY, state_index)
+      else
+         varying_ss_inflate    = 0.0_r8
+         varying_ss_inflate_sd = 0.0_r8
+      endif
 
-      if(final_factor <= 0.0_r8) cycle STATE_UPDATE
-      
-      call obs_updates_ens(ens_size, num_groups, ens_handle%copies(1:ens_size, state_index), &
-         my_state_loc(state_index), my_state_kind(state_index), obs_prior, obs_inc, &
-         obs_prior_mean, obs_prior_var, base_obs_loc, base_obs_type, obs_time, &
-         net_a, grp_size, grp_beg, grp_end, i, &
-         my_state_indx(state_index), final_factor, correl, local_varying_ss_inflate, inflate_only)
+      ! Compute the distance and covariance factor
+      cov_factor = comp_cov_factor(close_state_dist(j), cutoff_rev, &
+         base_obs_loc, base_obs_type, my_state_loc(state_index), my_state_kind(state_index))
+
+      ! if external impact factors supplied, factor them in here
+      ! FIXME: this would execute faster for 0.0 impact factors if
+      ! we check for that before calling comp_cov_factor.  but it makes
+      ! the logic more complicated - this is simpler if we do it after.
+      if (adjust_obs_impact) then
+         impact_factor = obs_impact_table(base_obs_type, my_state_kind(state_index))
+         cov_factor = cov_factor * impact_factor
+      endif
+
+      ! If no weight is indicated, no more to do with this state variable
+      if (filter_kind == 9) then ! note other filter kinds will need to cycle
+         if ( cov_factor == 0.0_r8 ) cycle STATE_UPDATE
+      end if
+
+      ! Update state for PF
+      if (filter_kind == 9) then
+
+         ! Update only when prior variance is not zero
+         if ( maxval( ens_handle%copies(1:ens_size, state_index)) /= &
+              minval( ens_handle%copies(1:ens_size, state_index)) ) then
+
+            ! Take running sum of -log() of weights
+            if (cov_factor == 1.0_r8) then
+              d = log(ens_size*hw)
+            else
+              d = wt*cov_factor
+              do n = 1,ens_size
+                if (abs(d(n)) > 0.1_r8) then
+                  d(n) = log( d(n) + 1.0_r8 )
+                end if
+              end do
+            end if
+            lw(1:ens_size,state_index) = lw(1:ens_size,state_index) - d
+            lw(1:ens_size,state_index) = lw(1:ens_size,state_index) - minval(lw(1:ens_size,state_index))
+
+            ! Get state-space weights
+            wo = exp(-lw(1:ens_size,state_index)/beta(state_index))
+            wo = wo/sum(wo)
+
+            ! Use weights to calculate posterior mean and variance
+            ens_mean = sum( wo * ens_init(1:ens_size,state_index) )
+           
+            if (sum(ens_handle%copies(1:ens_size,state_index))/ens_size .ne. ens_mean) then
+
+               ens_var = sum( wo * ( ens_init(1:ens_size,state_index) - ens_mean )**2 ) &
+                         / ( 1.0_r8 - sum(wo**2) )
+
+               ! Perform sampling from weighted prior or unweighted posterior 
+               if (sampling_weighted_prior) then
+                 d = ens_init(indx,state_index)
+               else
+                 d = ens_handle%copies(indx,state_index)
+               end if
+
+               ! Combine newly sampled particles with prior particles
+               call pf_update(ens_handle%copies(1:ens_size,state_index), ens_mean, ens_var, &
+                              increment(1:ens_size), ens_size, cov_factor, d, pf_alpha)
+
+            else
+   
+               increment(1:ens_size) = 0.0_r8
+
+            end if
+  
+            else
+
+           increment(1:ens_size) = 0.0_r8
+
+         endif
+
+         ! Set reg_factor to 1
+         reg_factor = 1.0_r8
+
+         ! Need correl for ss inflation
+         if(local_varying_ss_inflate .and. varying_ss_inflate > 0.0_r8 .and. &
+            varying_ss_inflate_sd > 0.0_r8 .and. filter_kind /= 9) then
+
+            call pf_calc_correl(obs_prior(1:ens_size),ens_handle%copies(1:ens_size, state_index), &
+                      ens_size, correl(1))
+
+            ! Include localization in correl
+            correl(1) = correl(1) * cov_factor
+         endif
+
+      else
+
+         ! All other filters
+
+         ! Loop through groups to update the state variable ensemble members
+         do group = 1, num_groups
+            grp_bot = grp_beg(group)
+            grp_top = grp_end(group)
+            ! Do update of state, correl only needed for varying ss inflate
+            if(local_varying_ss_inflate .and. varying_ss_inflate > 0.0_r8 .and. &
+               varying_ss_inflate_sd > 0.0_r8 .and. filter_kind /= 9) then
+               call update_from_obs_inc(obs_prior(grp_bot:grp_top), obs_prior_mean(group), &
+                  obs_prior_var(group), obs_inc(grp_bot:grp_top), &
+                  ens_handle%copies(grp_bot:grp_top, state_index), grp_size, &
+                  increment(grp_bot:grp_top), reg_coef(group), net_a(group), correl(group))
+            else
+               call update_from_obs_inc(obs_prior(grp_bot:grp_top), obs_prior_mean(group), &
+                  obs_prior_var(group), obs_inc(grp_bot:grp_top), &
+                  ens_handle%copies(grp_bot:grp_top, state_index), grp_size, &
+                  increment(grp_bot:grp_top), reg_coef(group), net_a(group))
+            endif
+         end do
+         if (timing(SM_GRN)) call read_timer(t_base(SM_GRN), 'update_from_obs_inc_S', &
+                                          t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+
+         ! Compute an information factor for impact of this observation on this state
+         if(num_groups == 1) then
+             reg_factor = 1.0_r8
+         else
+            ! Pass the time along with the index for possible diagnostic output
+            ! Compute regression factor for this obs-state pair
+            reg_factor = comp_reg_factor(num_groups, reg_coef, obs_time, i, my_state_indx(state_index))
+         endif
+
+         ! The final factor is the minimum of group regression factor and localization cov_factor
+         reg_factor = min(reg_factor, cov_factor)
+
+      endif ! Filter other than PF
+
+!PAR NEED TO TURN STUFF OFF MORE EFFICEINTLY
+      ! If doing full assimilation, update the state variable ensemble with weighted increments
+      if(.not. inflate_only) then
+         ens_handle%copies(1:ens_size, state_index) = &
+            ens_handle%copies(1:ens_size, state_index) + reg_factor * increment
+      endif
 
       ! Compute spatially-varying state space inflation
-      if(local_varying_ss_inflate) then
-         do group = 1, num_groups
-            call update_varying_state_space_inflation(inflate,                     &
-               ens_handle%copies(ENS_INF_COPY, state_index),                       &
-               ens_handle%copies(ENS_INF_SD_COPY, state_index),                    &
-               ens_handle%copies(ENS_SD_COPY, state_index),                        &
-               orig_obs_prior_mean(group), orig_obs_prior_var(group), obs(1),      &
-               obs_err_var, grp_size, final_factor, correl(group), inflate_only)
-         end do
+      if(local_varying_ss_inflate .and. filter_kind /= 9) then
+         ! base is the initial inflate value for this state variable
+         ss_inflate_base = ens_handle%copies(ENS_SD_COPY, state_index)
+         ! Loop through each group to update inflation estimate
+         GroupInflate: do group = 1, num_groups
+            if(varying_ss_inflate > 0.0_r8 .and. varying_ss_inflate_sd > 0.0_r8) then
+               ! Gamma is less than 1 for varying ss, see adaptive inflate module
+               gamma = reg_factor * abs(correl(group))
+               ! Deflate the inflated variance using the INITIAL state inflate
+               ! value (before these obs started gumming it up).
+               ens_obs_mean = orig_obs_prior_mean(group)
+               ens_obs_var =  orig_obs_prior_var(group)
+
+               ! Remove the impact of inflation to allow efficient single pass with assim.
+               if ( abs(gamma) > small ) then
+                  ens_var_deflate = ens_obs_var / &
+                     (1.0_r8 + gamma*(sqrt(ss_inflate_base) - 1.0_r8))**2
+               else
+                  ens_var_deflate = ens_obs_var
+               endif
+
+               ! If this is inflate only (i.e. posterior) remove impact of this obs.
+               if(inflate_only .and. &
+                     ens_var_deflate               > small .and. &
+                     obs_err_var                   > small .and. &
+                     obs_err_var - ens_var_deflate > small ) then
+                  r_var  = 1.0_r8 / (1.0_r8 / ens_var_deflate - 1.0_r8 / obs_err_var)
+                  r_mean = r_var *(ens_obs_mean / ens_var_deflate - obs(1) / obs_err_var)
+               else
+                  r_var = ens_var_deflate
+                  r_mean = ens_obs_mean
+               endif
+
+               ! IS A TABLE LOOKUP POSSIBLE TO ACCELERATE THIS?
+               ! Update the inflation values
+               if (timing(SM_GRN)) call start_timer(t_base(SM_GRN), t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+               call update_inflation(inflate, varying_ss_inflate, varying_ss_inflate_sd, &
+                  r_mean, r_var, grp_size, obs(1), obs_err_var, gamma)
+               if (timing(SM_GRN)) call read_timer(t_base(SM_GRN), 'update_inflation_V', &
+                                                   t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+            else
+               ! if we don't go into the previous if block, make sure these
+               ! have good values going out for the block below
+               r_mean = orig_obs_prior_mean(group)
+               r_var =  orig_obs_prior_var(group)
+            endif
+
+            ! Update adaptive values if posterior outlier_ratio test doesn't fail.
+            ! Match code in obs_space_diags() in filter.f90
+            do_adapt_inf_update = .true.
+            if (inflate_only) then
+               diff_sd = sqrt(obs_err_var + r_var)
+               if (diff_sd > 0.0_r8) then
+                  outlier_ratio = abs(obs(1) - r_mean) / diff_sd
+                  do_adapt_inf_update = (outlier_ratio <= 3.0_r8)
+               endif
+            endif
+            if (do_adapt_inf_update) then
+               ens_handle%copies(ENS_INF_COPY, state_index) = varying_ss_inflate
+               ens_handle%copies(ENS_INF_SD_COPY, state_index) = varying_ss_inflate_sd
+            endif
+         end do GroupInflate
       endif
+
    end do STATE_UPDATE
-
-   if(.not. inflate_only) then
-      ! Now everybody updates their obs priors (only ones after this one)
-      OBS_UPDATE: do j = 1, num_close_obs
-         obs_index = close_obs_ind(j)
-
-         ! If transform to probit failed for this observed variable, don't update it
-         if(.not. obs_probit_trans_ok(obs_index)) cycle OBS_UPDATE
-
-         ! Only have to update obs that have not yet been used
-         if(my_obs_indx(obs_index) > i) then
-
-            ! If forward observation operator failed, no need to update unassimilated observations
-            if (any(obs_ens_handle%copies(1:ens_size, obs_index) == MISSING_R8)) cycle OBS_UPDATE
-
-         ! Compute the covariance localization and adjust_obs_impact factors (module storage)
-            final_factor = cov_and_impact_factors(base_obs_loc, base_obs_type, my_obs_loc(obs_index), &
-            my_obs_kind(obs_index), close_obs_dist(j), cutoff_rev)
-
-            if(final_factor <= 0.0_r8) cycle OBS_UPDATE
-
-            call obs_updates_ens(ens_size, num_groups, obs_ens_handle%copies(1:ens_size, obs_index), &
-               my_obs_loc(obs_index), my_obs_kind(obs_index), obs_prior, obs_inc, &
-               obs_prior_mean, obs_prior_var, base_obs_loc, base_obs_type, obs_time, &
-               net_a, grp_size, grp_beg, grp_end, i, &
-               -1*my_obs_indx(obs_index), final_factor, correl, .false., inflate_only)
-         endif
-      end do OBS_UPDATE
+   if (timing(LG_GRN)) then
+      write(msgstring, '(A32,I7)') 'state_update: obs', keys(i)
+      call read_timer(t_base(LG_GRN), msgstring)
    endif
+
+   !call test_state_copies(ens_handle, 'after_state_updates')
+
+   !------------------------------------------------------
+
+   ! Now everybody updates their obs priors (only ones after this one)
+   if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
+   OBS_UPDATE: do j = 1, num_close_obs
+      obs_index = close_obs_ind(j)
+
+      ! The local PF now iterates multiple times over observations, so it still needs 
+      ! to update obs-space priors for measurements that are already assimilated.
+      ! For other filter_kinds, this line should be put back in to cycle for obs which 
+      ! have already been processed. 
+      ! if (my_obs_indx(obs_index) <= i) cycle OBS_UPDATE
+
+      ! Skip if regularization reaches threashold value 
+      if (filter_kind == 9) then
+         if ( beta_y(obs_index) == beta_max ) cycle OBS_UPDATE
+      end if
+
+      ! If the forward observation operator failed, no need to 
+      ! update the unassimilated observations 
+      if (any(obs_ens_handle%copies(1:ens_size, obs_index) == MISSING_R8)) cycle OBS_UPDATE
+
+      ! Compute the distance and the covar_factor
+      cov_factor = comp_cov_factor(close_obs_dist(j), cutoff_rev, &
+         base_obs_loc, base_obs_type, my_obs_loc(obs_index), my_obs_kind(obs_index))
+
+      ! if external impact factors supplied, factor them in here
+      ! FIXME: this would execute faster for 0.0 impact factors if
+      ! we check for that before calling comp_cov_factor.  but it makes
+      ! the logic more complicated - this is simpler if we do it after.
+      if (adjust_obs_impact) then
+         impact_factor = obs_impact_table(base_obs_type, my_obs_kind(obs_index))
+         cov_factor = cov_factor * impact_factor
+      endif
+ 
+      if (filter_kind == 9) then ! note other filter kinds will also need to cycle
+         if ( cov_factor == 0.0_r8 ) cycle OBS_UPDATE
+      end if
+
+      ! Update obs prior for PF
+      if (filter_kind == 9) then
+
+         ! Update only when prior variance is not zero
+         if ( maxval( obs_ens_handle%copies(1:ens_size, obs_index)) /= &
+              minval( obs_ens_handle%copies(1:ens_size, obs_index)) ) then
+
+            ! Take running sum of -log() of weights
+            if (cov_factor == 1.0_r8) then
+              d = log(ens_size*hw)
+            else
+              d = wt*cov_factor
+              do n = 1,ens_size
+                if (abs(d(n)) > 0.1_r8) then
+                  d(n) = log( d(n) + 1.0_r8 )
+                end if
+              end do
+            end if
+            lhw(1:ens_size,obs_index) = lhw(1:ens_size,obs_index) - d
+            lhw(1:ens_size,obs_index) = lhw(1:ens_size,obs_index) - minval(lhw(1:ens_size,obs_index))
+
+            ! Get obs-space weights
+            wo = exp(-lhw(1:ens_size,obs_index)/beta_y(obs_index))
+            wo = wo/sum(wo)
+
+            ! Use weights to calculate posterior mean and variance
+            ens_mean = sum( wo * obs_ens_init(1:ens_size,obs_index) )
+
+            if (sum(obs_ens_handle%copies(1:ens_size,obs_index))/ens_size .ne. ens_mean) then
+
+               ens_var = sum( wo * ( obs_ens_init(1:ens_size,obs_index) - ens_mean )**2 ) &
+                         / ( 1.0_r8 - sum(wo**2) )
+
+               ! Perform sampling from weighted prior or unweighted posterior 
+               if (sampling_weighted_prior) then
+                 d = obs_ens_init(indx,obs_index)
+               else
+                 d = obs_ens_handle%copies(indx, obs_index)
+               end if
+
+               ! Combine newly sampled particles with prior particles
+               call pf_update(obs_ens_handle%copies(1:ens_size,obs_index), ens_mean, ens_var, &
+                              increment(1:ens_size), ens_size, cov_factor, d, pf_alpha)
+
+
+            else
+   
+               increment(1:ens_size) = 0.0_r8
+   
+            end if
+
+   
+         else
+
+            increment(1:ens_size) = 0.0_r8
+
+         endif
+
+         ! Set reg_factor to 1
+         reg_factor = 1.0_r8
+
+      else
+
+         ! Loop through and update ensemble members in each group
+         do group = 1, num_groups
+            grp_bot = grp_beg(group)
+            grp_top = grp_end(group)
+            call update_from_obs_inc(obs_prior(grp_bot:grp_top), obs_prior_mean(group), &
+               obs_prior_var(group), obs_inc(grp_bot:grp_top), &
+                obs_ens_handle%copies(grp_bot:grp_top, obs_index), grp_size, &
+                increment(grp_bot:grp_top), reg_coef(group), net_a(group))
+         end do
+         if (timing(SM_GRN)) call read_timer(t_base(SM_GRN), 'update_from_obs_inc_O', &
+                                             t_items(SM_GRN), t_limit(SM_GRN), do_sync=.false.)
+
+         ! FIXME: could we move the if test for inflate only to here?
+
+         ! Compute an information factor for impact of this observation on this state
+         if(num_groups == 1) then
+             reg_factor = 1.0_r8
+         else
+            ! Pass the time along with the index for possible diagnostic output
+            ! Compute regression factor for this obs-state pair
+            ! Negative indicates that this is an observation index
+            reg_factor = comp_reg_factor(num_groups, reg_coef, obs_time, i, -1*my_obs_indx(obs_index))
+         endif
+
+         ! Final weight is min of group and localization factors
+         reg_factor = min(reg_factor, cov_factor)
+
+      endif ! Filter other than PF
+
+      ! Only update state if indicated (otherwise just getting inflation)
+      if(.not. inflate_only) then
+         obs_ens_handle%copies(1:ens_size, obs_index) = &
+           obs_ens_handle%copies(1:ens_size, obs_index) + reg_factor * increment
+      endif
+
+   end do OBS_UPDATE
+   if (timing(LG_GRN)) then
+      write(msgstring, '(A32,I7)') 'obs_update: obs', keys(i)
+      call read_timer(t_base(LG_GRN), msgstring)
+   endif
+
+   !call test_state_copies(ens_handle, 'after_obs_updates')
+
+   if (timing(MLOOP)) then
+      write(msgstring, '(A32,I7)') 'outer sequential obs loop: obs', keys(i)
+      call read_timer(t_base(MLOOP), msgstring, elapsed = elapse_array(i))
+   endif
+
 end do SEQUENTIAL_OBS
 
-! Do the inverse probit transform for state variables
-call transform_all_from_probit(ens_size, ens_handle%my_num_vars, ens_handle%copies, &
-   state_dist_params, ens_handle%copies, state_probit_trans_ok)
+! Additional corrections to state variables using KDDM
+if (filter_kind == 9 .and. pf_kddm > 0 ) then
+
+   if (my_task_id() == 0) then
+      call date_and_time( date, time )
+      write(msgstring,*) 'KDDM begin time: ',time(1:2),':',time(3:4),':',time(5:6)
+      call error_handler(E_MSG,'',msgstring)
+   endif
+
+   do i = 1,ens_handle%my_num_vars
+
+     ! Update only when posterior ensemble is outside span of prior ensemble
+     if ( ( maxval(ens_handle%copies(1:ens_size, i)) > maxval(ens_init(1:ens_size, i) ) ) .or. & 
+          ( minval(ens_handle%copies(1:ens_size, i)) < minval(ens_init(1:ens_size, i) ) ) ) then
+
+       wt = exp(-lw(1:ens_size,i)/beta(i))
+       wt = wt/sum(wt)
+
+       call pf_kddm_update(ens_handle%copies(1:ens_size,i), ens_init(1:ens_size,i), &
+           wt, ens_size, increment)
+
+       ens_handle%copies(1:ens_size, i) = ens_handle%copies(1:ens_size, i) + increment
+
+     endif
+
+   enddo
+
+   do i = 1,obs_ens_handle%my_num_vars
+
+     ! Update only when posterior ensemble is outside span of prior ensemble
+     if ( maxval(obs_ens_handle%copies(1:ens_size, i)) > maxval(obs_ens_init(1:ens_size, i) ) .or. & 
+        minval(obs_ens_handle%copies(1:ens_size, i)) < minval(obs_ens_init(1:ens_size, i) ) ) then
+
+       wt = exp(-lhw(1:ens_size,i)/beta_y(i))
+       wt = wt/sum(wt)
+
+       call pf_kddm_update(obs_ens_handle%copies(1:ens_size,i), obs_ens_init(1:ens_size,i), &
+               wt, ens_size, increment)
+
+       obs_ens_handle%copies(1:ens_size, i) = obs_ens_handle%copies(1:ens_size, i) + increment
+  
+     endif
+
+   enddo
+
+   if (my_task_id() == 0) then
+      call date_and_time( date, time )
+      write(msgstring,*) 'KDDM end time:   ',time(1:2),':',time(3:4),':',time(5:6)
+      call error_handler(E_MSG,'',msgstring)
+   endif
+
+endif ! KDDM
+
+! Perform RTPS step for hybrid. For hybrid PF-EAKF the last iteration switches to EAKF (filter_kind=1)
+if (filter_kind == 1 .and. .not. local_varying_ss_inflate) then
+
+   if (my_task_id() == 0) then
+
+      write(msgstring, *) 'Performing RTPS with alpha of',pf_kf_rtps_coeff
+      call error_handler(E_MSG,'filter_assim:',msgstring)
+
+   end if
+
+   do i = 1,ens_handle%my_num_vars
+
+      wt = ens_init(1:ens_size, i) - sum(ens_init(1:ens_size, i)) / ens_size
+      temp1 = sqrt( sum(wt**2) / (ens_size - 1.0_r8) )
+      ens_mean = sum(ens_handle%copies(1:ens_size, i)) / ens_size
+      hw = ens_handle%copies(1:ens_size, i) - ens_mean
+      temp2 = sqrt( sum(hw**2) / (ens_size - 1.0_r8) )
+      if (temp2 > 0.0_r8) then
+         ens_handle%copies(1:ens_size, i) = ens_mean + hw*( pf_kf_rtps_coeff*(temp1 - temp2)/temp2 + 1.0_r8)
+      end if
+
+   end do
+
+   do i = 1,obs_ens_handle%my_num_vars
+
+      wt = obs_ens_init(1:ens_size, i) - sum(obs_ens_init(1:ens_size, i)) / ens_size
+      temp1 = sqrt( sum(wt**2) / (ens_size - 1.0_r8) )
+      ens_mean = sum(obs_ens_handle%copies(1:ens_size, i)) / ens_size
+      hw = obs_ens_handle%copies(1:ens_size, i) - ens_mean
+      temp2 = sqrt( sum(hw**2) / (ens_size - 1.0_r8) )
+      if (temp2 > 0.0_r8) then
+         obs_ens_handle%copies(1:ens_size, i) = ens_mean + hw*( pf_kf_rtps_coeff*(temp1 - temp2)/temp2 + 1.0_r8)
+      end if
+
+   end do
+
+
+   if (my_task_id() == 0) then
+
+      write(msgstring, *) 'Completed iteration with EAKF'
+      call error_handler(E_MSG,'filter_assim:',msgstring)
+
+   end if
+
+   ! USE RTPS FOR EAKF ONLY
+   if (iter > 1) then
+      exit ITERATIONS
+   end if
+
+end if
+
+! Exit PF loop by setting max_res to zero once maxiter is reached
+if (iter == maxiter-1) then
+  max_res = 0.0_r8
+end if
+
+! Exit PF iteration loop when sum of regularization coefficients surpasses threshold
+if (filter_kind == 9 .and. max_res == 0.0_r8) then
+
+  if (my_task_id() == 0) then
+
+     write(msgstring, *) 'Number of PF iterations: ',iter
+     call error_handler(E_MSG,'filter_assim:',msgstring)
+
+  end if
+
+  ! Exit if EAKF is not needed
+  if (.not. pf_enkf_hybrid) then
+     exit ITERATIONS
+  end if
+
+  ! Switch to EAKF for last iteration 
+  filter_kind = 1
+
+end if
+
+end do ITERATIONS
+
+! Switch back to PF if needed
+if (filter_kind_orig == 9) then
+  filter_kind = 9
+end if
 
 ! Every pe needs to get the current my_inflate and my_inflate_sd back
 if(local_single_ss_inflate) then
@@ -850,13 +2062,44 @@ call destroy_obs(observation)
 call get_close_destroy(gc_state)
 call get_close_destroy(gc_obs)
 
+! print some stats about the assimilation
+! (if interesting, could print exactly which obs # was fastest and slowest)
+if (my_task_id() == 0 .and. timing(MLOOP)) then
+   write(msgstring, *) 'average assim time: ', sum(elapse_array) / size(elapse_array)
+   call error_handler(E_MSG,'filter_assim:',msgstring)
+
+   write(msgstring, *) 'minimum assim time: ', minval(elapse_array)
+   call error_handler(E_MSG,'filter_assim:',msgstring)
+
+   write(msgstring, *) 'maximum assim time: ', maxval(elapse_array)
+   call error_handler(E_MSG,'filter_assim:',msgstring)
+endif
+
+if (timing(MLOOP)) deallocate(elapse_array)
+
 ! do some stats - being aware that unless we do a reduce() operation
 ! this is going to be per-task.  so only print if something interesting
 ! shows up in the stats?  maybe it would be worth a reduce() call here?
 
+!>@todo FIXME:  
+!  we have n_close_obs_items and n_close_state_items for each assimilated
+!  observation.  what we really want to know is across the tasks is there
+!  a big difference in counts?  so that means communication.  maybe just
+!  the largest value?  and the number of 0 values?  and if the largest val
+!  is way off compared to the other tasks, warn the user?
+!  we don't have space or time to do all the obs * tasks but could we
+!  send enough info to make a histogram?  compute N bin counts and then
+!  reduce that across all the tasks and have task 0 print out?
+! still thinking on this idea.
+!   write(msgstring, *) 'max state items per observation: ', maxval(n_close_state_items)
+!   call error_handler(E_MSG, 'filter_assim:', msgstring)
+! if i come up with something i like, can we use the same idea
+! for the threed_sphere locations boxes?
+
 ! Assure user we have done something
 if (print_trace_details >= 0) then
-   write(msgstring, '(A,I8,A)') 'Processed', obs_ens_handle%num_vars, ' total observations'
+write(msgstring, '(A,I8,A)') &
+   'Processed', obs_ens_handle%num_vars, ' total observations'
    call error_handler(E_MSG,'filter_assim:',msgstring)
 endif
 
@@ -880,36 +2123,44 @@ endif
 
 !call test_state_copies(ens_handle, 'end')
 
-! Close the localization diagnostics file
-if(output_localization_diagnostics .and. my_task_id() == 0) call close_file(localization_unit)
+!GSR close the localization diagnostics file
+if(output_localization_diagnostics .and. my_task_id() == 0) then
+  call close_file(localization_unit)
+end if
 
 ! get rid of mpi window
 call free_mean_window()
 
 ! deallocate space
 deallocate(close_obs_dist,      &
+           last_close_obs_dist, &
            my_obs_indx,         &
            my_obs_kind,         &
            my_obs_type,         &
            close_obs_ind,       &
+           last_close_obs_ind,  &
            vstatus,             &
-           my_obs_loc,          &
-           state_probit_trans_ok)
+           my_obs_loc)
 
 deallocate(close_state_dist,      &
+           last_close_state_dist, &
            my_state_indx,         &
            close_state_ind,       &
+           last_close_state_ind,  &
            my_state_kind,         &
-           my_state_loc,          &
-           obs_probit_trans_ok)
+           my_state_loc)
 
+deallocate(n_close_state_items, &
+           n_close_obs_items)
 ! end dealloc
+
+close(debugfileunit)
 
 end subroutine filter_assim
 
 !-------------------------------------------------------------
 
-subroutine obs_increment(ens_in, ens_size, obs, obs_var, obs_kind, obs_inc, &
+subroutine obs_increment(ens_in, ens_size, obs, obs_var, obs_inc, &
    inflate, my_cov_inflate, my_cov_inflate_sd, net_a)
 
 ! Given the ensemble prior for an observation, the observation, and
@@ -918,7 +2169,6 @@ subroutine obs_increment(ens_in, ens_size, obs, obs_var, obs_kind, obs_inc, &
 
 integer,                     intent(in)    :: ens_size
 real(r8),                    intent(in)    :: ens_in(ens_size), obs, obs_var
-integer,                     intent(in)    :: obs_kind
 real(r8),                    intent(out)   :: obs_inc(ens_size)
 type(adaptive_inflate_type), intent(inout) :: inflate
 real(r8),                    intent(inout) :: my_cov_inflate, my_cov_inflate_sd
@@ -929,13 +2179,6 @@ real(r8) :: prior_mean, prior_var, new_val(ens_size)
 integer  :: i, ens_index(ens_size), new_index(ens_size)
 
 real(r8) :: rel_weights(ens_size)
-
-integer  :: filter_kind
-logical  :: bounded_below, bounded_above
-real(r8) :: lower_bound,   upper_bound
-
-! Declarations for bounded rank histogram filter
-real(r8) :: likelihood(ens_size), like_sum
 
 ! Copy the input ensemble to something that can be modified
 ens = ens_in
@@ -967,12 +2210,6 @@ if(do_obs_inflate(inflate)) then
       prior_var  = sum((ens - prior_mean)**2) / (ens_size - 1)
 endif
 
-! Gets information about the increment method (filter_kind, bounds) for the current observation.
-call obs_inc_info(obs_kind, filter_kind, bounded_below, bounded_above, &
-                  lower_bound, upper_bound)
-
-! The first three options in the next if block of code may be inappropriate for 
-! some more general filters; need to revisit
 ! If obs_var == 0, delta function.  The mean becomes obs value with no spread.
 ! If prior_var == 0, obs has no effect.  The increments are 0.
 ! If both obs_var and prior_var == 0 there is no right thing to do, so Stop.
@@ -1002,111 +2239,51 @@ else
    ! note that at this point we've taken care of the cases where either the
    ! obs_var or the prior_var is 0, so the individual routines no longer need
    ! to have code to test for those cases.
-   if(filter_kind == EAKF) then
+   if(filter_kind == 1) then
       call obs_increment_eakf(ens, ens_size, prior_mean, prior_var, &
          obs, obs_var, obs_inc, net_a)
-   else if(filter_kind == ENKF) then
+   else if(filter_kind == 2) then
       call obs_increment_enkf(ens, ens_size, prior_var, obs, obs_var, obs_inc)
-   else if(filter_kind == KERNEL) then
+   else if(filter_kind == 3) then
       call obs_increment_kernel(ens, ens_size, obs, obs_var, obs_inc)
-   else if(filter_kind == OBS_PARTICLE) then
+   else if(filter_kind == 4) then
       call obs_increment_particle(ens, ens_size, obs, obs_var, obs_inc)
-   else if(filter_kind == UNBOUNDED_RHF) then
+   else if(filter_kind == 5) then
+      call obs_increment_ran_kf(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
+   else if(filter_kind == 6) then
+      call obs_increment_det_kf(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
+   else if(filter_kind == 7) then
+      call obs_increment_boxcar(ens, ens_size, obs, obs_var, obs_inc, rel_weights)
+   else if(filter_kind == 8) then
       call obs_increment_rank_histogram(ens, ens_size, prior_var, obs, obs_var, obs_inc)
-   else if(filter_kind == GAMMA_FILTER) then
-      call obs_increment_gamma(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
-   !--------------------------------------------------------------------------
-   else if(filter_kind == BOUNDED_NORMAL_RHF) then
-
-      ! Use bounded normal likelihood; Could use an arbitrary likelihood
-      do i = 1, ens_size
-         likelihood(i) = get_truncated_normal_like(ens(i), obs, obs_var, &
-            bounded_below, bounded_above, lower_bound, upper_bound)
-      end do
-
-      ! Normalize the likelihood here
-      like_sum = sum(likelihood)
-      ! If likelihood underflow, assume flat likelihood, so no increments
-      if(like_sum <= 0.0_r8) then
-         obs_inc = 0.0_r8
-         return
-      else
-         likelihood = likelihood / like_sum
-      endif
-
-      call obs_increment_bounded_norm_rhf(ens, likelihood, ens_size, prior_var, &
-         obs_inc, bounded_below, bounded_above, lower_bound, upper_bound)
-
-      ! Do test of inversion for an uninformative likelihood
-      !!!t_likelihood = 1.0
-      !!!t_likelihood = t_likelihood / sum(t_likelihood)
-      !!!call obs_increment_bounded_norm_rhf(ens, t_likelihood, ens_size, prior_var, &
-         !!!obs_inc_temp, bounded_below, bounded_above, lower_bound, upper_bound)
-      !!!if(maxval(abs(obs_inc_temp)) > 1e-3_r8) then
-         !!!write(msgstring, *) 'Null increment tests exceed the threshold ', maxval(abs(obs_inc_temp))
-         !!!call error_handler(E_ERR, 'obs_increment', msgstring, source)
-      !!!endif
-
-   !--------------------------------------------------------------------------
-
-   else if(filter_kind == KDE_FILTER) then
-      call obs_increment_kde(ens, ens_size, obs, obs_var, bounded_below, &
-         bounded_above, lower_bound, upper_bound, obs_inc)
    else
       call error_handler(E_ERR,'obs_increment', &
-              'Illegal value of filter_kind', source)
+              'Illegal value of filter_kind in assim_tools namelist [1-8 OK]', source)
    endif
 endif
 
 ! Add in the extra increments if doing observation space covariance inflation
 if(do_obs_inflate(inflate)) obs_inc = obs_inc + inflate_inc
 
+! To minimize regression errors, may want to sort to minimize increments
+! This makes sense for any of the non-deterministic algorithms
+! By doing it here, can take care of both standard non-deterministic updates
+! plus non-deterministic obs space covariance inflation. This is expensive, so
+! don't use it if it's not needed.
+if (sort_obs_inc) then
+   new_val = ens_in + obs_inc
+   ! Sorting to make increments as small as possible
+   call index_sort(ens_in, ens_index, ens_size)
+   call index_sort(new_val, new_index, ens_size)
+   do i = 1, ens_size
+      obs_inc(ens_index(i)) = new_val(new_index(i)) - ens_in(ens_index(i))
+   end do
+endif
+
 ! Get the net change in spread if obs space inflation was used
 if(do_obs_inflate(inflate)) net_a = net_a * sqrt(my_cov_inflate)
 
 end subroutine obs_increment
-
-
-
-subroutine obs_increment_gamma(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
-!========================================================================
-!
-! Gamma version of obs increment. This demonstrates the updat
-
-integer,  intent(in)  :: ens_size
-real(r8), intent(in)  :: ens(ens_size), prior_mean, prior_var, obs, obs_var
-real(r8), intent(out) :: obs_inc(ens_size)
-
-real(r8) :: prior_shape, prior_scale, like_shape, like_scale, post_shape, post_scale
-real(r8) :: q(ens_size), post(ens_size)
-integer :: i
-
-! Compute the prior quantiles of each ensemble member in the prior gamma distribution
-call gamma_mn_var_to_shape_scale(prior_mean, prior_var, prior_shape, prior_scale)
-do i = 1, ens_size
-   q(i) = gamma_cdf(ens(i), prior_shape, prior_scale) 
-end do
-
-! Compute the statistics of the continous posterior distribution
-call gamma_mn_var_to_shape_scale(obs, obs_var, like_shape, like_scale)
-call gamma_gamma_prod(prior_shape, prior_scale, like_shape, like_scale, &
-   post_shape, post_scale)
-
-! Check for illegal values. This can occur if the distributions are getting too
-! concentrated towards the bound
-if(post_shape <= 0.0_r8) then
-   write(msgstring, *) 'Posterior gamma shape is negative ', post_shape
-   call error_handler(E_ERR, 'obs_increment_gamma', msgstring, source)
-endif
-
-! Now invert the quantiles with the posterior distribution
-do i = 1, ens_size
-   post(i) = inv_gamma_cdf(q(i), post_shape, post_scale)
-end do
-
-obs_inc = post - ens
-
-end subroutine obs_increment_gamma
 
 
 
@@ -1133,105 +2310,148 @@ obs_inc = a * (ens - prior_mean) + new_mean - ens
 end subroutine obs_increment_eakf
 
 
-subroutine obs_increment_bounded_norm_rhf(ens, ens_like, ens_size, prior_var, &
-   obs_inc, bounded_below, bounded_above, lower_bound, upper_bound)
-!------------------------------------------------------------------------
-integer,  intent(in)  :: ens_size
-real(r8), intent(in)  :: ens(ens_size)
-real(r8), intent(in)  :: ens_like(ens_size)
-real(r8), intent(in)  :: prior_var
-real(r8), intent(out) :: obs_inc(ens_size)
-logical,  intent(in)  :: bounded_below, bounded_above
-real(r8), intent(in)  :: lower_bound,   upper_bound
+subroutine obs_increment_ran_kf(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
+!========================================================================
+!
+! Forms a random sample of the Gaussian from the update equations.
+! This is very close to what a true 'ENSEMBLE' Kalman Filter would
+! look like. Note that outliers, multimodality, etc., get tossed.
 
-! Does bounded RHF assuming that the prior in outer regions is part of a normal. 
+integer,   intent(in)  :: ens_size
+real(r8),  intent(in)  :: prior_mean, prior_var
+real(r8),  intent(in)  :: ens(ens_size), obs, obs_var
+real(r8),  intent(out) :: obs_inc(ens_size)
 
-real(r8) :: sort_ens(ens_size), sort_ens_like(ens_size)
-real(r8) :: post(ens_size), sort_post(ens_size), q(ens_size)
-real(r8) :: tail_amp_left,  tail_mean_left,  tail_sd_left
-real(r8) :: tail_amp_right, tail_mean_right, tail_sd_right
-logical  :: do_uniform_tail_left, do_uniform_tail_right
-integer  :: i, sort_ind(ens_size)
+real(r8) :: new_mean, var_ratio
+real(r8) :: temp_mean, temp_var, new_ens(ens_size), new_var
+integer  :: i
 
-! If all ensemble members are identical, this algorithm becomes undefined, so fail
-if(prior_var <= 0.0_r8) then
-      msgstring = 'Ensemble variance <= 0 '
-      call error_handler(E_ERR, 'obs_increment_bounded_norm_rhf', msgstring, source)
+var_ratio = obs_var / (prior_var + obs_var)
+new_var = var_ratio * prior_var
+new_mean  = var_ratio * (prior_mean  + prior_var*obs / obs_var)
+
+! This will reproduce exactly for multiple runs with the same task count,
+! but WILL NOT reproduce for a different number of MPI tasks.
+! To make it independent of the number of MPI tasks, it would need to
+! use the global ensemble number or something else that remains constant
+! as the processor count changes.  this is not currently an argument to
+! this function and so we are not trying to make it task-count invariant.
+
+! Form a random sample from the updated distribution
+! Then adjust the mean (what about adjusting the variance?)!
+! Definitely need to sort with this; sort is done in main obs_increment
+if(first_inc_ran_call) then
+   call init_random_seq(inc_ran_seq, my_task_id() + 1)
+   first_inc_ran_call = .false.
 endif
 
-! Do an index sort of the ensemble members; Use prior info for efficiency in the future
-call index_sort(ens, sort_ind, ens_size)
-
-! Get the sorted ensemble
-sort_ens = ens(sort_ind)
-
-! Get the sorted likelihood
-sort_ens_like = ens_like(sort_ind)
-
-! Generate the prior information for a BNRH for this ensemble
-call bnrh_cdf(ens, ens_size, bounded_below, bounded_above, lower_bound, upper_bound, &
-   sort_ens, q, tail_amp_left,  tail_mean_left,  tail_sd_left,  do_uniform_tail_left,  &
-   tail_amp_right, tail_mean_right, tail_sd_right, do_uniform_tail_right)
-
-! Invert the bnrh cdf after it is multiplied by the likelihood
-call inv_bnrh_cdf_like(q, ens_size, sort_ens, &
-   bounded_below, bounded_above, lower_bound, upper_bound, &
-   tail_amp_left,  tail_mean_left,  tail_sd_left,  do_uniform_tail_left, &
-   tail_amp_right, tail_mean_right, tail_sd_right, do_uniform_tail_right, post, &
-   sort_ens_like)
-! The posterior needs to be sorted to get increments; this can be done more efficiently
-sort_post = post(sort_ind)
-
-! These are increments for sorted ensemble; convert to increments for unsorted
 do i = 1, ens_size
-   obs_inc(sort_ind(i)) = sort_post(i) - ens(sort_ind(i))
-   ! It may be possible, although apparently exceedingly unusual, to generate an increment
-   ! here that when added back onto the prior leads to a posterior that is greater than 
-   ! the bounds. Unclear if there is any direct way to fix this given that increments are
-   ! being passed out.
+   new_ens(i) = random_gaussian(inc_ran_seq, new_mean, sqrt(prior_var*var_ratio))
 end do
 
-end subroutine obs_increment_bounded_norm_rhf
+! Adjust the mean of the new ensemble
+temp_mean = sum(new_ens) / ens_size
+new_ens(:) = new_ens(:) - temp_mean + new_mean
 
-! Computes a normal or truncated normal (above and/or below) likelihood.
-function get_truncated_normal_like(x, obs, obs_var, &
-   bounded_below, bounded_above, lower_bound, upper_bound)
-!------------------------------------------------------------------------
-real(r8)             :: get_truncated_normal_like
-real(r8), intent(in) :: x
-real(r8), intent(in) :: obs, obs_var
-logical,  intent(in) :: bounded_below, bounded_above
-real(r8), intent(in) :: lower_bound,   upper_bound
+! Compute prior variance and mean from sample
+temp_var  = sum((new_ens - new_mean)**2) / (ens_size - 1)
+! Adjust the variance, also
+new_ens = (new_ens - new_mean) * sqrt(new_var / temp_var) + new_mean
 
-real(r8) :: cdf(2), obs_sd, weight
+! Get the increments
+obs_inc = new_ens - ens
 
-! A zero observation error variance is a degenerate case
-if(obs_var <= 0.0_r8) then
-   if(x == obs) then
-      get_truncated_normal_like = 1.0_r8
-   else
-      get_truncated_normal_like = 0.0_r8
-   endif
-   return
+end subroutine obs_increment_ran_kf
+
+
+
+subroutine obs_increment_det_kf(ens, ens_size, prior_mean, prior_var, obs, obs_var, obs_inc)
+!========================================================================
+!
+! Does a deterministic ensemble layout for the updated Gaussian.
+! Note that all outliers, multimodal behavior, etc. get tossed.
+
+integer,  intent(in)  :: ens_size
+real(r8), intent(in)  :: prior_mean, prior_var
+real(r8), intent(in)  :: ens(ens_size), obs, obs_var
+real(r8), intent(out) :: obs_inc(ens_size)
+
+real(r8) :: new_mean, var_ratio, temp_var, new_ens(ens_size), new_var
+integer :: i
+
+var_ratio = obs_var / (prior_var + obs_var)
+new_var = var_ratio * prior_var
+new_mean = var_ratio * (prior_mean  + prior_var*obs / obs_var)
+
+! Want a symmetric distribution with kurtosis 3 and variance new_var and mean new_mean
+if(ens_size /= 20) then
+   write(*, *) 'EXPERIMENTAL version obs_increment_det_kf only works for ens_size 20 now'
+   stop
 endif
 
-obs_sd = sqrt(obs_var)
+! This has kurtosis of 3.0, verify again from initial uniform
+!new_ens(1) = -2.146750_r8
+!new_ens(2) = -1.601447_r8
+!new_ens(3) = -1.151582_r8
+!new_ens(4) = -0.7898650_r8
+!new_ens(5) = -0.5086292_r8
+!new_ens(6) = -0.2997678_r8
+!new_ens(7) = -0.1546035_r8
+!new_ens(8) = -6.371084E-02_r8
+!new_ens(9) = -1.658448E-02_r8
+!new_ens(10) = -9.175255E-04_r8
 
-! If the truth were at point x, what is the weight of the truncated normal obs error dist?
-! If no bounds, the whole cdf is possible
-cdf(1) = 0.0_r8
-cdf(2) = 1.0_r8
+! This has kurtosis of 3.0, verify again from initial inverse gaussian
+!new_ens(1) = -2.188401_r8
+!new_ens(2) = -1.502174_r8
+!new_ens(3) = -1.094422_r8
+!new_ens(4) = -0.8052422_r8
+!new_ens(5) = -0.5840152_r8
+!new_ens(6) = -0.4084518_r8
+!new_ens(7) = -0.2672727_r8
+!new_ens(8) = -0.1547534_r8
+!new_ens(9) = -6.894587E-02_r8
+!new_ens(10) = -1.243549E-02_r8
 
-! Compute the cdf's at the bounds if they exist
-if(bounded_below) cdf(1) = normal_cdf(lower_bound, x, obs_sd)
-if(bounded_above) cdf(2) = normal_cdf(upper_bound, x, obs_sd)
+! This has kurtosis of 2.0, verify again
+new_ens(1) = -1.789296_r8
+new_ens(2) = -1.523611_r8
+new_ens(3) = -1.271505_r8
+new_ens(4) = -1.033960_r8
+new_ens(5) = -0.8121864_r8
+new_ens(6) = -0.6077276_r8
+new_ens(7) = -0.4226459_r8
+new_ens(8) = -0.2598947_r8
+new_ens(9) = -0.1242189_r8
+new_ens(10) = -2.539018E-02_r8
 
-! The weight is the reciprocal of the fraction of the cdf that is in legal range
-weight = 1.0_r8 / (cdf(2) - cdf(1))
+! This has kurtosis of 1.7, verify again
+!new_ens(1) = -1.648638_r8
+!new_ens(2) = -1.459415_r8
+!new_ens(3) = -1.272322_r8
+!new_ens(4) = -1.087619_r8
+!new_ens(5) = -0.9056374_r8
+!new_ens(6) = -0.7268229_r8
+!new_ens(7) = -0.5518176_r8
+!new_ens(8) = -0.3816142_r8
+!new_ens(9) = -0.2179997_r8
+!new_ens(10) = -6.538583E-02_r8
+do i = 11, 20
+   new_ens(i) = -1.0_r8 * new_ens(20 + 1 - i)
+end do
 
-get_truncated_normal_like = weight * exp(-1.0_r8 * (x - obs)**2 / (2.0_r8 * obs_var))
+! Right now, this ensemble has mean 0 and some variance
+! Compute prior variance and mean from sample
+temp_var  = sum((new_ens)**2) / (ens_size - 1)
 
-end function get_truncated_normal_like
+! Adjust the variance of this ensemble to match requirements and add in the mean
+new_ens = new_ens * sqrt(new_var / temp_var) + new_mean
+
+! Get the increments
+obs_inc = new_ens - ens
+
+end subroutine obs_increment_det_kf
+
 
 
 
@@ -1318,8 +2538,7 @@ real(r8), intent(out) :: obs_inc(ens_size)
 real(r8) :: obs_var_inv, prior_var_inv, new_var, new_mean(ens_size)
 ! real(r8) :: sx, s_x2
 real(r8) :: temp_mean, temp_obs(ens_size)
-real(r8) :: new_val(ens_size)
-integer  :: i, ens_index(ens_size), new_index(ens_size)
+integer  :: i
 
 ! Compute mt_rinv_y (obs error normalized by variance)
 obs_var_inv = 1.0_r8 / obs_var
@@ -1353,21 +2572,6 @@ do i = 1, ens_size
    new_mean(i) = new_var * (prior_var_inv * ens(i) + temp_obs(i) / obs_var)
    obs_inc(i)  = new_mean(i) - ens(i)
 end do
-
-! To minimize regression errors, may want to sort to minimize increments
-! This makes sense for any of the non-deterministic algorithms
-! By doing it here, can take care of both standard non-deterministic updates
-! plus non-deterministic obs space covariance inflation. This is expensive, so
-! don't use it if it's not needed.
-if (sort_obs_inc) then 
-   new_val = ens + obs_inc
-   ! Sorting to make increments as small as possible
-   call index_sort(ens, ens_index, ens_size)
-   call index_sort(new_val, new_index, ens_size)
-   do i = 1, ens_size
-      obs_inc(ens_index(i)) = new_val(new_index(i)) - ens(ens_index(i))
-   end do
-endif
 
 ! Can also adjust mean (and) variance of final sample; works fine
 !sx         = sum(new_mean)
@@ -1444,8 +2648,6 @@ if(first_inc_ran_call) then
 endif
 
 ! Generate a uniform random number and a Gaussian for each new member
-!! IG: This could be done with a single random number and in a way that
-!! preserves the order of the ensemble members
 do i = 1, ens_size
    unif = random_uniform(inc_ran_seq)
    ! Figure out which kernel it's in
@@ -1469,8 +2671,555 @@ end subroutine obs_increment_kernel
 
 
 
+subroutine pf_regularization(lw, ens_size, Neff, beta, beta_max)
+!------------------------------------------------------------------------
+!
+!  Calculate regularization factors for particle filter: J. Poterjoy Jun. 2019
+! 
+
+integer,  intent(in)    :: ens_size
+real(r8), intent(in)    :: Neff, beta_max, lw(ens_size)
+real(r8), intent(out)   :: beta
+
+real(r8) :: Neff_init, Neff_final, ke, km, ks, ws
+real(r8) :: tol, fke, fkm, fks, w(ens_size), beta_base
+integer  :: i, tot
+
+! Initial weights and Neff
+w = exp(-lw)
+ws = sum(w)
+w = w/ws
+Neff_init = 1.0_r8 / sum( w**2 )
+
+! Inflate if effective ensemble size is smaller than threshold
+if ( ( Neff_init < Neff ) .or. ( ws == 0.0_r8 ) ) then
+
+   ! Initial start and end bounds
+   ks = 1
+!   ke = max(10.0_r8,maxval(lw)**4)
+   ke = max(10.0_r8,maxval(lw)**2)
+
+   ! Apply bisection method to solve for k
+   tol = 1E-3_r8
+   do i = 1,1000
+ 
+      ! Mid point
+      km = (ke + ks) / 2.0_r8
+  
+      ! Evaluate function at end points
+      w = exp(-lw/ks)
+      if (sum(w) == 0.0_r8) then
+         fks = Neff - 1.0_r8
+      else
+         w = w / sum(w)
+         fks = Neff - 1.0_r8 / sum(w**2)
+      end if
+
+      w = exp(-lw/ke)
+      w = w / sum(w)
+      fke = Neff - 1.0_r8 / sum(w**2)
+
+      ! Evaluate function at mid points
+      w = exp(-lw/km)
+      if (sum(w) == 0.0_r8) then
+         fkm = Neff - 1.0_r8
+      else
+         w = w / sum(w)
+         fkm = Neff - 1.0_r8 / sum(w**2)
+      end if
+
+      ! Exit critera
+      if ( abs(ke-ks) < tol ) exit
+ 
+      ! New end points 
+      if ( fkm * fks > 0.0_r8 ) then
+        ks = km
+      else
+        ke = km
+      end if
+
+   end do
+
+   beta = km
+
+   ! Underflow errors can still lead to wrong result
+   w = exp( -lw/beta)
+   w = w / sum(w)
+   Neff_final = 1.0_r8 / sum(w**2)
+   ! Target Neff is not always obtainable when multiple members have zero weights.
+   ! Set beta to max value when min value of 2 is not reached.
+   if (Neff_final < Neff - 0.1_r8) then
+      beta = beta_max
+      write(*,*) 'Warning: setting beta to beta_max'
+      write(*,*) 'Neff:',Neff_final
+      write(*,*) 'min w:',minval(w)
+      write(*,*) 'neff iter:',minval(w)
+  end if
+
+  ! Sanity check
+  !write(*,*) ' Starting Neff: ',Neff_init,' Target Neff: ',Neff,'New Neff: ',Neff_final,'beta: ',beta,'iterations: ',i
+
+else
+
+   beta = 1.0_r8
+
+end if
+
+
+end subroutine pf_regularization
+
+
+
+
+subroutine pf_regularization_minw(lw, minwt, ens_size, beta)
+!------------------------------------------------------------------------
+!
+!  Calculate regularization factors for particle filter: J. Poterjoy Jun. 2019
+! 
+
+integer,  intent(in)    :: ens_size
+real(r8), intent(in)    :: lw(ens_size), minwt
+real(r8), intent(out)   :: beta
+
+real(r8) :: minw, ke, km, ks, ws
+real(r8) :: tol, fke, fkm, fks, w(ens_size)
+integer  :: i
+
+! Initial weights and minw
+w = exp(-lw)
+ws = sum(w)
+w = w/ws
+
+! Inflate if min normalized weight is smaller than threshold
+if ( ( minval(w) < minwt ) .or. ( ws == 0.0_r8 ) ) then
+
+   ! Initial start and end bounds
+   ks = 1
+!   ke = maxval(lw/30.0_r8)
+   ke = maxval(lw)
+  
+   ! Apply bisection method to solve for k
+   tol = 0.001_r8
+
+   do i = 1,1000
+ 
+      ! Mid point
+      km = (ke + ks) / 2.0_r8
+  
+      ! Evaluate function at end points
+      w = exp(-lw/ks)
+      if (sum(w) == 0.0_r8) then
+         fks = minwt
+      else
+         w = w / sum(w)
+         fks = minwt - minval(w)
+      end if
+
+      w = exp(-lw/ke)
+      w = w / sum(w)
+      fke = minwt - minval(w)
+
+      ! Evaluate function at mid points
+      w = exp(-lw/km)
+      w = w / sum(w)
+      fkm = minwt - minval(w)
+
+      ! Exit critera
+      if ( abs(ke-ks)/2.0_r8 < tol ) exit
+ 
+      ! New end points 
+      if ( fkm * fks > 0.0_r8 ) then
+        ks = km
+      else
+        ke = km
+      end if
+
+   end do
+
+   beta = km
+
+   w = exp(-lw/beta)
+   w = w / sum(w)
+
+  ! Sanity check
+  !write(*,*) ' Target min w: ',minwt,'New min w: ',minval(w),'beta: ',beta,'iterations: ',i
+
+else
+
+   beta = 1.0_r8
+
+end if
+
+
+end subroutine pf_regularization_minw
+
+
+
+subroutine pf_calc_correl(obs, state, ens_size, correl)
+               
+!========================================================================
+
+! Compute correl for adaptive inflation
+
+integer,            intent(in)    :: ens_size
+real(r8),           intent(in)    :: obs(ens_size)
+real(r8),           intent(in)    :: state(ens_size)
+real(r8),           intent(out)   :: correl
+
+real(r8) :: obs_state_cov, intermed, state_mean, state_var, obs_prior_mean, obs_prior_var
+
+obs_prior_mean = sum(obs(1:ens_size)) / ens_size
+obs_prior_var  = sum((obs(1:ens_size) - obs_prior_mean)**2) / (ens_size - 1)
+
+state_mean = sum(state) / ens_size
+obs_state_cov = sum( (state - state_mean) * (obs - obs_prior_mean) ) / (ens_size - 1)
+
+if (obs_state_cov == 0.0_r8 .or. obs_prior_var <= 0.0_r8) then
+   correl = 0.0_r8
+else
+   state_var = sum((state - state_mean)**2) / (ens_size - 1)
+   if (state_var <= 0.0_r8) then
+      correl = 0.0_r8
+   else
+      intermed = sqrt(obs_prior_var) * sqrt(state_var)
+      if (intermed <= 0.0_r8) then
+         correl = 0.0_r8
+      else
+         correl = obs_state_cov / intermed
+      endif
+   endif
+
+endif
+if(correl >  1.0_r8) correl =  1.0_r8
+if(correl < -1.0_r8) correl = -1.0_r8
+
+end subroutine pf_calc_correl
+
+
+
+subroutine pf_sample(ens, w, ens_size, indx2)
+!------------------------------------------------------------------------
+!
+!  Perform sampling step of particle filter: J. Poterjoy Nov. 2014
+! 
+
+integer,  intent(in)    :: ens_size
+real(r8), intent(in)    :: w(ens_size), ens(ens_size)
+integer,  intent(out)   :: indx2(ens_size)
+
+real(r8) :: cw(0:ens_size), base, frac, dum
+integer  :: i, j, indx0(ens_size), indx1(ens_size), m, ind(ens_size)
+
+! Find sorting indices and sort weights
+call index_sort(ens, ind, ens_size)
+
+! Perform deterministic resampling
+cw(0) = 0.0_r8
+do i = 1, ens_size
+   cw(i) = cw(i - 1) + w(ind(i))
+end do
+
+! Divide interval into ens_size parts and choose new particles
+! based on the interval they accumulate in
+
+base = 1.0_r8 / ens_size / 2.0_r8
+
+j = 1
+do i = 1, ens_size
+
+   frac = base + (i - 1.0_r8) / ens_size
+
+   ! Search in the cumulative range to see where frac falls
+   m = 0
+   do while (m == 0)
+      if(cw(j - 1) < frac .and. frac <= cw(j)) then
+         indx1(i) = j
+         m = 1
+      else
+         j = j + 1
+      end if
+   end do
+
+end do
+
+! Unsort indices
+indx1 = ind(indx1)
+indx0 = indx1
+
+! If a particle is removed, it is replaced by a duplicated
+! particle. This is accomplished by looping through indx1
+! and flagging replicated indices with a zero, and
+! indicating their location in indx2
+
+! Locate the removed indices in indx1
+do i = 1, ens_size
+
+   ! Locate first occurance of index i in indx1
+   m = minloc(indx1, 1, mask=indx1.eq.i)
+
+   if ( m == 0 ) then
+      ! If i is not in indx1, flag the index with a zero in indx2
+      indx2(i) = 0
+   else
+      ! If i is in indx1, indicate value in indx2
+      indx2(i) = i
+      ! Flag value in indx1 with a zero to show it was removed
+      indx1(m) = 0
+   endif
+
+end do
+
+! TEMP: Uncomment/comment this loop when commenting/uncommenting 
+!       the next one
+! Replace the removed indices with duplicated ones
+do i = 1, ens_size
+  if (indx2(i) == 0) then
+     do m = 1, ens_size
+       if (indx1(m) /= 0) exit
+     end do
+     indx2(i) = indx1(m)
+     indx1(m) = 0
+  endif
+end do
+
+!! TEMP: Maximize covariance between sampled and removed particles
+!do while (sum(indx1) > 0)
+!  i = minloc(ens(indx0), 1, mask=indx1.gt.0)
+!  m = minloc(ens, 1, mask=indx2.eq.0)
+!  indx2(m) = indx1(i)
+!  indx1(i) = 0
+!end do
+
+
+
+! FOR TESTING PURPOSE
+!do i = 1,ens_size
+!  if ( ens(i) .ne. ens(indx2(i)) ) then
+!    write(*,*) 'replacing',ens(i),'with',ens(indx2(i))
+!  end if
+!end do
+
+
+end subroutine pf_sample
+
+
+
+subroutine pf_update(ens, ens_mean, ens_var, incr, ens_size, loc, ens_s, pf_alpha)
+!------------------------------------------------------------------------
+!
+!  Perform update of particles from weights: J. Poterjoy Nov. 2014
+! 
+
+integer,  intent(in)  :: ens_size
+real(r8), intent(in)  :: ens(ens_size), loc, pf_alpha, ens_s(ens_size)
+real(r8), intent(in)  :: ens_mean, ens_var
+real(r8), intent(out) :: incr(ens_size)
+
+real(r8) :: r1, r2, c, c2, em, rho, T1, T2, T3, m1, m2, v1, v2, v3
+real(r8) :: ens_post(ens_size), pf_alpha2, smin, smax, alpha
+integer  :: i, k
+
+! Calculate weights for updating
+c = (1.0_r8-loc)/loc
+
+! r1 and r2 determine coefficients for updating ensemble
+v1 = 0.0_r8
+v2 = 0.0_r8
+v3 = 0.0_r8
+do i = 1, ens_size
+  v1 = v1 + ( ens_s(i) - ens_mean )**2
+  v2 = v2 + ( ens(i) - ens_mean )**2
+  v3 = v3 + ( ens(i) - ens_mean )*( ens_s(i) - ens_mean )
+end do
+
+c2 = c*c
+r1 = v1 + v2*c2 + 2.0_r8*v3*c
+r2 = c2/r1
+
+! The coeffiecient pf_alpha reduces part of the update to maintain particle diversity 
+! near observation. While pf_alpha is specified, pf_alpha2 is derived to maintain the
+! correct amount of spread
+
+alpha = pf_alpha
+
+r1 = alpha*sqrt((ens_size-1.0_r8)*ens_var/r1)
+r2 = sqrt((ens_size-1.0_r8)*ens_var*r2)
+
+m1 = sum(ens_s - ens_mean)/ens_size
+m2 = sum(ens - ens_mean)/ens_size
+v1 = v1 - ens_size*m1**2
+v2 = v2 - ens_size*m2**2
+v3 = v3 - ens_size*m1*m2
+T1 = v2
+T2 = 2.0_r8*( r1*v3 + r2*v2 )
+T3 = v1*r1**2 + v2*r2**2 + 2.0_r8*v3*r1*r2 - (ens_size-1.0_r8)*ens_var
+
+pf_alpha2 = ( - T2 + sqrt( T2**2 - 4.0_r8*T1*T3 ) ) / (2.0_r8*T1)
+
+r2 = r2 + pf_alpha2
+
+! Update ensemble using mix of prior members and sampled members
+do i = 1, ens_size
+  ens_post(i) = ens_mean + r1*( ens_s(i) - ens_mean ) + r2*( ens(i) - ens_mean )
+end do
+
+! Adjust posterior mean and variance to correct for sampling errors
+em = sum( ens_post ) / ens_size
+ens_post = ens_mean + (ens_post - em)
+incr = ens_post - ens
+
+end subroutine pf_update
+
+
+subroutine pf_kddm_update(ens1, ens2, w, ens_size, incr)
+
+!------------------------------------------------------------------------
+!
+!  Apply kernel density distribution mapping method proposed by Seth McGinnis
+!  to map a sample of particles into posterior particles:  J. Poterjoy Jan. 2015
+! 
+
+integer,  intent(in)  :: ens_size
+real(r8), intent(in)  :: ens1(ens_size), ens2(ens_size)
+real(r8), intent(inout) :: w(ens_size)
+real(r8), intent(out) :: incr(ens_size)
+integer,  parameter   :: npoints = 3000
+integer               :: i, m, ind(ens_size)
+real(r8)              :: xd(npoints), cda(npoints), qf(ens_size), x(ens_size)
+real(r8)              :: w2, w1, r(ens_size)
+
+! Note: The specified npoints should depend on range and bandwidth of domain
+
+! Use kernels to approximate quantiles and posterior cdf
+call pf_get_q_cda(ens1,ens2,ens_size,npoints,w,xd,qf,cda)
+
+! Correct prior quantiles that land outside span of ensemble
+if ( minval(qf) < minval(cda) ) then
+
+   r(1) = 1.0_r8
+   r(ens_size) = 0.0_r8
+   do i = 2,ens_size-1
+     r(i) = r(i-1) - 1.0_r8 / (ens_size - 1.0_r8)
+   end do
+
+   ! Sorting indices for quantiles
+   call index_sort(ens1, ind, ens_size)
+
+   ! Perform correction
+   qf(ind) = qf(ind) + r*( minval(cda) - minval(qf) )
+
+end if
+
+if ( maxval(qf) > maxval(cda) ) then
+
+   r(1) = 0.0_r8
+   r(ens_size) = 1.0_r8
+   do i = 2,ens_size-1
+     r(i) = r(i-1) + 1.0_r8 / (ens_size - 1.0_r8)
+   end do
+
+   ! Sorting indices for quantiles
+   call index_sort(ens1, ind, ens_size)
+
+   ! Perform correction
+   qf(ind) = qf(ind) + r*( maxval(cda) - maxval(qf) )
+
+end if
+
+! Invert posterior cdf to find values at prior quantiles
+do i = 1,ens_size
+
+   if ( qf(i) >= maxval(cda) ) then 
+      x(i) = maxval(xd)
+   else if ( qf(i) <= minval(cda) ) then 
+      x(i) = minval(xd)
+   else
+
+      m = minloc(cda, 1, mask=cda.gt.qf(i))
+  
+      if ( (qf(i) == cda(m)) .or. (m == 1) ) then
+         x(i) = xd(m)
+      else
+
+         if (cda(m) > qf(i)) m = m - 1
+
+         if ( cda(m+1) - cda(m) < 1E-20_r8 ) then
+            w1 = ( cda(m+1) - qf(i) ) / ( cda(m+1) - cda(m) )
+            w2 = ( qf(i) - cda(m) ) / ( cda(m+1) - cda(m) )
+            x(i) = w1 * xd(m) + w2 * xd(m+1)
+         else
+            x(i) = xd(m)
+         end if
+
+      end if
+
+   end if
+
+end do
+
+incr = x - ens1
+
+end subroutine pf_kddm_update
+
+
+
+subroutine pf_get_q_cda(ens1,ens2,ens_size,npoints,w,x,qf,cda)
+!------------------------------------------------------------------------
+!
+! Gaussian kernel density estimation:  J. Poterjoy Jan. 2015
+! 
+! This subroutine returns prior quantiles and posterior cdf
+! estimated using Gaussian kernels.
+
+integer,            intent(in)    :: ens_size, npoints
+real(r8),           intent(in)    :: ens1(ens_size), ens2(ens_size), w(ens_size)
+real(r8),           intent(out)   :: x(npoints), qf(ens_size), cda(npoints)
+integer                           :: i, m
+real(r8)                          :: bw, xmin, xmax, v2, range
+
+! Bandwidth is set to sample standard deviation
+!v2 = sum(w*ens1)
+!v2 = sum(w*( ens1 - v2 )**2 ) / (1.0_r8 - sum(w**2))
+!v2 =  sum(ens2)/ens_size
+!v2 = sum( (ens2 - v2)**2 ) /(ens_size - 1.0_r8)
+!bw = sqrt(v2)/10.0_r8
+
+v2 = sum(ens2)/ens_size
+v2 = sum( ( ens2 - v2 )**2 ) / (ens_size - 1.0_r8)
+bw = sqrt(v2)/4.0_r8
+
+! Domain for calculating posterior cdf
+!xmin = min(minval(ens1),minval(ens2)) - 2*bw
+!xmax = max(maxval(ens1),maxval(ens2)) + 2*bw
+xmin = minval(ens2) - 2*bw
+xmax = maxval(ens2) + 2*bw
+range = xmax-xmin
+do i=1,npoints
+  x(i) = xmin + (i-1.0_r8)*range/(npoints-1.0_r8)
+end do
+
+! Estimate quantiles and cdfs by taking sum over Gaussian cdfs
+qf  = 0.0_r8
+cda = 0.0_r8
+do i = 1,ens_size
+
+   ! Prior quantiles
+   qf = qf + ( 1.0_r8 + erf( (ens1 - ens1(i) )/(sqrt(2.0_r8)*bw) ) )/(2.0_r8*ens_size)
+
+   ! Posterior cdf
+   cda = cda + w(i) * ( 1.0_r8 + erf( (x - ens2(i) )/(sqrt(2.0_r8)*bw) ) )/2.0_r8
+
+end do
+
+
+
+!write(*,*) minval(cda),maxval(cda)
+
+end subroutine pf_get_q_cda
+
+
 subroutine update_from_obs_inc(obs, obs_prior_mean, obs_prior_var, obs_inc, &
-               state, ens_size, state_inc, reg_coef, net_a_in, correl_out)
+               state, ens_size, state_inc, reg_coef, net_a, correl_out)
 !========================================================================
 
 ! Does linear regression of a state variable onto an observation and
@@ -1481,12 +3230,12 @@ real(r8),           intent(in)    :: obs(ens_size), obs_inc(ens_size)
 real(r8),           intent(in)    :: obs_prior_mean, obs_prior_var
 real(r8),           intent(in)    :: state(ens_size)
 real(r8),           intent(out)   :: state_inc(ens_size), reg_coef
-real(r8),           intent(in) :: net_a_in
+real(r8),           intent(inout) :: net_a
 real(r8), optional, intent(inout) :: correl_out
 
 real(r8) :: obs_state_cov, intermed
 real(r8) :: restoration_inc(ens_size), state_mean, state_var, correl
-real(r8) :: factor, exp_true_correl, mean_factor, net_a
+real(r8) :: factor, exp_true_correl, mean_factor
 
 
 ! For efficiency, just compute regression coefficient here unless correl is needed
@@ -1546,6 +3295,41 @@ endif
 
 ! Then compute the increment as product of reg_coef and observation space increment
 state_inc = reg_coef * obs_inc
+
+!
+! FIXME: craig schwartz has a degenerate case involving externally computed
+! forward operators in which the obs prior variance is in fact exactly 0.
+! adding this test allowed him to continue to  use spread restoration
+! without numerical problems.  we don't know if this is sufficient;
+! for now we'll leave the original code but it needs to be revisited.
+!
+! Spread restoration algorithm option.
+!if(spread_restoration .and. obs_prior_var > 0.0_r8) then
+!
+
+! Spread restoration algorithm option.
+if(spread_restoration) then
+   ! Don't use this to reduce spread at present (should revisit this line)
+   if(net_a > 1.0_r8) net_a = 1.0_r8
+
+   ! Default restoration increment is 0.0
+   restoration_inc = 0.0_r8
+
+   ! Compute the factor by which to inflate
+   ! These come from correl_error.f90 in system_simulation and the files ens??_pairs and
+   ! ens_pairs_0.5 in work under system_simulation. Assume a linear reduction from 1
+   ! as a function of the net_a. Assume that the slope of this reduction is a function of
+   ! the reciprocal of the ensemble_size (slope = 0.80 / ens_size). These are empirical
+   ! for now. See also README in spread_restoration_paper documentation.
+   !!!factor = 1.0_r8 / (1.0_r8 + (net_a - 1.0_r8) * (0.8_r8 / ens_size)) - 1.0_r8
+   factor = 1.0_r8 / (1.0_r8 + (net_a - 1.0_r8) / (-2.4711_r8 + 1.6386_r8 * ens_size)) - 1.0_r8
+   !!!factor = 1.0_r8 / (1.0_r8 + (net_a**2 - 1.0_r8) * (-0.0111_r8 + .8585_r8 / ens_size)) - 1.0_r8
+
+   ! Variance restoration
+   state_mean = sum(state) / ens_size
+   restoration_inc = factor * (state - state_mean)
+   state_inc = state_inc + restoration_inc
+endif
 
 !! NOTE: if requested to be returned, correl_out is set further up in the
 !! code, before the sampling error correction, if enabled, is applied.
@@ -1632,9 +3416,183 @@ endif
 end subroutine get_correction_from_table
 
 
+
+subroutine obs_increment_boxcar(ens, ens_size, obs, obs_var, obs_inc, rel_weight)
+!------------------------------------------------------------------------
+!
+! An observation space update that uses a set of boxcar kernels plus two
+! half-gaussians on the wings to represent the prior distribution. If N is
+! the ensemble size, 1/(N+1) of the mass is placed between each ensemble
+! member. This is reminiscent of the ranked historgram approach for
+! evaluating ensembles. The prior distribution on the wings is
+! represented by a half gaussian with mean being the outermost ensemble
+! member (left or right) and variance being somewhat arbitrarily chosen
+! as half the total ensemble sample variance. A particle
+! filter like algorithm is then used for the update. The weight associated
+! with each prior ensemble member is computed by evaluating the likelihood.
+! For the interior, the domain for each boxcar is divided in half and each
+! half is associated with the nearest ensemble member. The updated mass in
+! each half box is the product of the prior mass and the ensemble weight.
+! In the wings, the observation likelihood gaussian is convolved with the
+! prior gaussian to get an updated weighted gaussian that is assumed to
+! represent the posterior outside of the outermost ensemble members. The
+! updated ensemble members are chosen so that 1/(N+1) of the updated
+! mass is between each member and also on the left and right wings. This
+! algorithm is able to deal well with outliers, bimodality and other
+! non-gaussian behavior in observation space. It could also be modified to
+! deal with non-gaussian likelihoods in the future.
+
+integer,  intent(in)  :: ens_size
+real(r8), intent(in)  :: ens(ens_size), obs, obs_var
+real(r8), intent(out) :: obs_inc(ens_size)
+real(r8), intent(out) :: rel_weight(ens_size)
+
+integer  :: i, e_ind(ens_size), lowest_box, j
+real(r8) :: sx, prior_mean, prior_var, prior_var_d2
+real(r8) :: var_ratio, new_var, new_sd, umass, left_weight, right_weight
+real(r8) :: mass(2*ens_size), weight(ens_size), cumul_mass(0:2*ens_size)
+real(r8) :: new_mean_left, new_mean_right, prod_weight_left, prod_weight_right
+real(r8) :: new_ens(ens_size), mass_sum, const_term
+real(r8) :: x(1:2*ens_size - 1), sort_inc(ens_size)
+
+! The factor a is not defined for this filter for now (could it be???)
+
+! The relative weights could be used for a multi-dimensional particle-type
+! update using update_ens_from_weights. There are algorithmic challenges
+! with outliers so this is not currently a supported option. For now,
+! rel_weight is simply set to 0 and is unused elsewhere.
+rel_weight = 0.0_r8
+
+! Do an index sort of the ensemble members; Need sorted ensemble
+call index_sort(ens, e_ind, ens_size)
+
+! Prior distribution is boxcar in the central bins with 1/(n+1) density
+! in each intermediate bin. BUT, distribution on the wings is a normal with
+! 1/(n + 1) of the mass on each side.
+
+! Begin by computing a weight for each of the prior ensemble membersA
+! This is just evaluating the gaussian likelihood
+const_term = 1.0_r8 / (sqrt(2.0_r8 * PI) * sqrt(obs_var))
+do i = 1, ens_size
+   weight(i) = const_term * exp(-1.0_r8 * (ens(i) - obs)**2 / (2.0_r8 * obs_var))
+end do
+
+! Compute the points that bound all the updated mass boxes; start with ensemble
+do i = 1, ens_size
+   x(2*i - 1) = ens(e_ind(i))
+end do
+! Compute the mid-point interior boundaries; these are halfway between ensembles
+do i = 2, 2*ens_size - 2, 2
+   x(i) = (x(i - 1) + x(i + 1)) / 2.0_r8
+end do
+
+! Compute the s.d. of the ensemble for getting the gaussian wings
+sx         = sum(ens)
+prior_mean = sx / ens_size
+prior_var  = sum((ens - prior_mean)**2) / (ens_size - 1)
+
+! Need to normalize the wings so they have 1/(ens_size + 1) mass outside
+! Since 1/2 of a normal is outside, need to multiply by 2 / (ens_size + 1)
+
+! Need some sort of width for the boundary kernel, try 1/2 the VAR for now
+prior_var_d2 = prior_var / 2.0_r8
+
+! Compute the product of the obs error gaussian with the prior gaussian (EAKF)
+! Left wing first
+var_ratio = obs_var / (prior_var_d2 + obs_var)
+new_var = var_ratio * prior_var_d2
+new_sd = sqrt(new_var)
+new_mean_left  = var_ratio * (ens(e_ind(1))  + prior_var_d2*obs / obs_var)
+new_mean_right  = var_ratio * (ens(e_ind(ens_size))  + prior_var_d2*obs / obs_var)
+! REMEMBER, this product has an associated weight which must be taken into account
+! See Anderson and Anderson for this weight term (or tutorial kernel filter)
+prod_weight_left =  2.71828_r8 ** (-0.5_r8 * (ens(e_ind(1))**2 / prior_var_d2 + &
+      obs**2 / obs_var - new_mean_left**2 / new_var)) / sqrt(2.0_r8 * PI)
+
+prod_weight_right =  2.71828_r8 ** (-0.5_r8 * (ens(e_ind(ens_size))**2 / prior_var_d2 + &
+      obs**2 / obs_var - new_mean_right**2 / new_var)) / sqrt(2.0_r8 * PI)
+
+! Split into 2*ens_size domains; mass in each is computed
+! Start by computing mass in the outermost (gaussian) regions
+mass(1) = norm_cdf(ens(e_ind(1)), new_mean_left, new_sd) * &
+   prod_weight_left * (2.0_r8 / (ens_size + 1.0_r8))
+mass(2*ens_size) = (1.0_r8 - norm_cdf(ens(e_ind(ens_size)), new_mean_right, &
+   new_sd)) * prod_weight_right * (2.0_r8 / (ens_size + 1.0_r8))
+
+! Compute mass in the inner half boxes that have ensemble point on the left
+do i = 2, 2*ens_size - 2, 2
+   mass(i) = (1.0_r8 / (2.0_r8 * (ens_size + 1.0_r8))) * weight(e_ind(i/2))
+end do
+
+! Now right inner half boxes
+do i = 3, 2*ens_size - 1, 2
+   mass(i) = (1.0_r8 / (2.0_r8 * (ens_size + 1.0_r8))) * weight(e_ind(i/2 + 1))
+end do
+
+! Now normalize the mass in the different bins
+mass_sum = sum(mass)
+mass = mass / mass_sum
+
+! Find cumulative mass at each box boundary and middle boundary
+cumul_mass(0) = 0.0_r8
+do i = 1, 2*ens_size
+   cumul_mass(i) = cumul_mass(i - 1) + mass(i)
+end do
+
+! Get resampled ensemble, Need 1/(ens_size + 1) between each
+umass = 1.0_r8 / (ens_size + 1.0_r8)
+
+! Begin search at bottom of lowest box, but then update for efficiency
+lowest_box = 1
+
+! Find each new ensemble members location
+do i = 1, ens_size
+   ! If it's in the inner or outer range have to use normal
+   if(umass < cumul_mass(1)) then
+      ! In the first normal box
+      left_weight = (1.0_r8 / mass_sum) * prod_weight_left * (2.0_r8 / (ens_size + 1.0_r8))
+      call weighted_norm_inv(left_weight, new_mean_left, new_sd, umass, new_ens(i))
+   else if(umass > cumul_mass(2*ens_size - 1)) then
+      ! In the last normal box; Come in from the outside
+      right_weight = (1.0_r8 / mass_sum) * prod_weight_right * (2.0_r8 / (ens_size + 1.0_r8))
+      call weighted_norm_inv(right_weight, new_mean_right, new_sd, 1.0_r8 - umass, new_ens(i))
+      new_ens(i) = new_mean_right + (new_mean_right - new_ens(i))
+   else
+      ! In one of the inner uniform boxes.
+      FIND_BOX:do j = lowest_box, 2 * ens_size - 2
+         ! Find the box that this mass is in
+         if(umass >= cumul_mass(j) .and. umass <= cumul_mass(j + 1)) then
+            new_ens(i) = x(j) + ((umass - cumul_mass(j)) / (cumul_mass(j+1) - cumul_mass(j))) * &
+               (x(j + 1) - x(j))
+            ! Don't need to search lower boxes again
+            lowest_box = j
+            exit FIND_BOX
+         end if
+      end do FIND_BOX
+   endif
+   ! Want equally partitioned mass in update with exception that outermost boxes have half
+   umass = umass + 1.0_r8 / (ens_size + 1.0_r8)
+end do
+
+! Can now compute sorted increments
+do i = 1, ens_size
+   sort_inc(i) = new_ens(i) - ens(e_ind(i))
+end do
+
+! Now, need to convert to increments for unsorted
+do i = 1, ens_size
+   obs_inc(e_ind(i)) = sort_inc(i)
+end do
+
+end subroutine obs_increment_boxcar
+
+
+
 subroutine obs_increment_rank_histogram(ens, ens_size, prior_var, &
    obs, obs_var, obs_inc)
 !------------------------------------------------------------------------
+!
+! Revised 14 November 2008
 !
 ! Does observation space update by approximating the prior distribution by
 ! a rank histogram. Prior and posterior are assumed to have 1/(n+1) probability
@@ -1661,13 +3619,16 @@ subroutine obs_increment_rank_histogram(ens, ens_size, prior_var, &
 ! and new ensemble members are located so that 1/(n+1) of the mass is between
 ! each member and on the tails.
 
+! This code is still under development. Please contact Jeff Anderson at
+! jla@ucar.edu if you are interested in trying it.
+
 integer,  intent(in)  :: ens_size
 real(r8), intent(in)  :: ens(ens_size), prior_var, obs, obs_var
 real(r8), intent(out) :: obs_inc(ens_size)
 
 integer  :: i, e_ind(ens_size), lowest_box, j
-real(r8) :: prior_sd, var_ratio, umass, left_amp, right_amp, norm_const
-real(r8) :: left_mean, right_mean
+real(r8) :: prior_sd, var_ratio, umass, left_amp, right_amp
+real(r8) :: left_sd, left_var, right_sd, right_var, left_mean, right_mean
 real(r8) :: mass(ens_size + 1), like(ens_size), cumul_mass(0:ens_size + 1)
 real(r8) :: nmass(ens_size + 1)
 real(r8) :: new_mean_left, new_mean_right, prod_weight_left, prod_weight_right
@@ -1680,16 +3641,20 @@ real(r8) :: a, b, c, hright, hleft, r1, r2, adj_r1, adj_r2
 
 ! Do an index sort of the ensemble members; Will want to do this very efficiently
 call index_sort(ens, e_ind, ens_size)
-x = ens(e_ind)
 
-! Define normal PDF constant term
-norm_const = 1.0_r8 / sqrt(2.0_r8 * PI * obs_var)
-! Compute likelihood for each ensemble member; just evaluate the gaussian
 do i = 1, ens_size
-   like(i) = norm_const * exp(-1.0_r8 * (x(i) - obs)**2 / (2.0_r8 * obs_var))
+   ! The boundaries of the interior bins are just the sorted ensemble members
+   x(i) = ens(e_ind(i))
+   ! Compute likelihood for each ensemble member; just evaluate the gaussian
+   ! No need to compute the constant term since relative likelihood is what matters
+   like(i) = exp(-1.0_r8 * (x(i) - obs)**2 / (2.0_r8 * obs_var))
 end do
 
-! Compute approx likelihood each interior bin (average of bounding likelihoods)
+! Prior distribution is boxcar in the central bins with 1/(n+1) density
+! in each intermediate bin. BUT, distribution on the tails is a normal with
+! 1/(n + 1) of the mass on each side.
+
+! Can now compute the mean likelihood density in each interior bin
 do i = 2, ens_size
    like_dense(i) = ((like(i - 1) + like(i)) / 2.0_r8)
 end do
@@ -1699,55 +3664,64 @@ prior_sd = sqrt(prior_var)
 
 ! For unit normal, find distance from mean to where cdf is 1/(n+1)
 ! Lots of this can be done once in first call and then saved
-dist_for_unit_sd = inv_weighted_normal_cdf(1.0_r8, 0.0_r8, 1.0_r8, &
-   1.0_r8 / (ens_size + 1.0_r8))
+call weighted_norm_inv(1.0_r8, 0.0_r8, 1.0_r8, &
+   1.0_r8 / (ens_size + 1.0_r8), dist_for_unit_sd)
 dist_for_unit_sd = -1.0_r8 * dist_for_unit_sd
 
 ! Have variance of tails just be sample prior variance
 ! Mean is adjusted so that 1/(n+1) is outside
 left_mean = x(1) + dist_for_unit_sd * prior_sd
+left_var = prior_var
+left_sd = prior_sd
 ! Same for right tail
 right_mean = x(ens_size) - dist_for_unit_sd * prior_sd
+right_var = prior_var
+right_sd = prior_sd
 
 if(gaussian_likelihood_tails) then
    !*************** Block to do Gaussian-Gaussian on tail **************
    ! Compute the product of the obs likelihood gaussian with the priors
    ! Left tail gaussian first
-   var_ratio = obs_var / (prior_var + obs_var)
-   new_var_left = var_ratio * prior_var
+   var_ratio = obs_var / (left_var + obs_var)
+   new_var_left = var_ratio * left_var
    new_sd_left = sqrt(new_var_left)
-   new_mean_left  = var_ratio * (left_mean  + prior_var*obs / obs_var)
+   new_mean_left  = var_ratio * (left_mean  + left_var*obs / obs_var)
    ! REMEMBER, this product has an associated weight which must be taken into account
    ! See Anderson and Anderson for this weight term (or tutorial kernel filter)
-   prod_weight_left =  exp(-0.5_r8 * (left_mean**2 / prior_var + &
+   ! NOTE: The constant term has been left off the likelihood so we don't have
+   ! to divide by sqrt(2 PI) in this expression
+   prod_weight_left =  exp(-0.5_r8 * (left_mean**2 / left_var + &
          obs**2 / obs_var - new_mean_left**2 / new_var_left)) / &
-         sqrt(prior_var + obs_var) / sqrt(2.0_r8 * PI)
+         sqrt(left_var + obs_var)
    ! Determine how much mass is in the updated tails by computing gaussian cdf
-   mass(1) = normal_cdf(x(1), new_mean_left, new_sd_left) * prod_weight_left
+   mass(1) = norm_cdf(x(1), new_mean_left, new_sd_left) * prod_weight_left
 
    ! Same for the right tail
-   var_ratio = obs_var / (prior_var + obs_var)
-   new_var_right = var_ratio * prior_var
+   var_ratio = obs_var / (right_var + obs_var)
+   new_var_right = var_ratio * right_var
    new_sd_right = sqrt(new_var_right)
-   new_mean_right  = var_ratio * (right_mean  + prior_var*obs / obs_var)
-   prod_weight_right =  exp(-0.5_r8 * (right_mean**2 / prior_var + &
+   new_mean_right  = var_ratio * (right_mean  + right_var*obs / obs_var)
+   ! NOTE: The constant term has been left off the likelihood so we don't have
+   ! to divide by sqrt(2 PI) in this expression
+   prod_weight_right =  exp(-0.5_r8 * (right_mean**2 / right_var + &
          obs**2 / obs_var - new_mean_right**2 / new_var_right)) / &
-         sqrt(prior_var + obs_var) / sqrt(2.0_r8 * PI)
+         sqrt(right_var + obs_var)
    ! Determine how much mass is in the updated tails by computing gaussian cdf
-   mass(ens_size + 1) = (1.0_r8 - normal_cdf(x(ens_size), new_mean_right, new_sd_right)) * &
-      prod_weight_right
-
+   mass(ens_size + 1) = (1.0_r8 - norm_cdf(x(ens_size), new_mean_right, &
+      new_sd_right)) * prod_weight_right
    !************ End Block to do Gaussian-Gaussian on tail **************
 else
    !*************** Block to do flat tail for likelihood ****************
    ! Flat tails: THIS REMOVES ASSUMPTIONS ABOUT LIKELIHOOD AND CUTS COST
-   new_sd_left = prior_sd
+   new_var_left = left_var
+   new_sd_left = left_sd
    new_mean_left = left_mean
    prod_weight_left = like(1)
    mass(1) = like(1) / (ens_size + 1.0_r8)
 
    ! Same for right tail
-   new_sd_right = prior_sd
+   new_var_right = right_var
+   new_sd_right = right_sd
    new_mean_right = right_mean
    prod_weight_right = like(ens_size)
    mass(ens_size + 1) = like(ens_size) / (ens_size + 1.0_r8)
@@ -1800,13 +3774,13 @@ do i = 1, ens_size
    if(umass < cumul_mass(1)) then
       ! It's in the left tail
       ! Get position of x in weighted gaussian where the cdf has value umass
-      new_ens(i) = inv_weighted_normal_cdf(left_amp, new_mean_left, new_sd_left, &
-         umass)
+      call weighted_norm_inv(left_amp, new_mean_left, new_sd_left, &
+         umass, new_ens(i))
    else if(umass > cumul_mass(ens_size)) then
       ! It's in the right tail
       ! Get position of x in weighted gaussian where the cdf has value umass
-      new_ens(i) = inv_weighted_normal_cdf(right_amp, new_mean_right, new_sd_right, &
-         1.0_r8 - umass)
+      call weighted_norm_inv(right_amp, new_mean_right, new_sd_right, &
+         1.0_r8 - umass, new_ens(i))
       ! Coming in from the right, use symmetry after pretending its on left
       new_ens(i) = new_mean_right + (new_mean_right - new_ens(i))
    else
@@ -1924,8 +3898,8 @@ prior_sd = sqrt(prior_var)
 
 ! Need to normalize the wings so they have 1/(2*ens_size) mass outside
 ! Use cdf to find out how much mass is left of 1st member, right of last
-total_mass_left = normal_cdf(ens(e_ind(1)), prior_mean, prior_sd)
-total_mass_right = 1.0_r8 - normal_cdf(ens(e_ind(ens_size)), prior_mean, prior_sd)
+total_mass_left = norm_cdf(ens(e_ind(1)), prior_mean, prior_sd)
+total_mass_right = 1.0_r8 - norm_cdf(ens(e_ind(ens_size)), prior_mean, prior_sd)
 
 ! Find the mass in each division given the initial equal partition and the weights
 updated_mass(1) = rel_weight(e_ind(1)) / (2.0_r8 * ens_size)
@@ -1966,10 +3940,10 @@ do i = 1, ens_size
    ! If it's in the inner or outer range have to use normal
    if(mass < cumul_mass(1)) then
       ! In the first normal box
-      new_ens(i) = inv_weighted_normal_cdf(alpha(1), prior_mean, prior_sd, mass)
+      call weighted_norm_inv(alpha(1), prior_mean, prior_sd, mass, new_ens(i))
    else if(mass > cumul_mass(2*ens_size - 1)) then
       ! In the last normal box; Come in from the outside
-      new_ens(i) = inv_weighted_normal_cdf(alpha(2), prior_mean, prior_sd, 1.0_r8 - mass)
+      call weighted_norm_inv(alpha(2), prior_mean, prior_sd, 1.0_r8 - mass, new_ens(i))
       new_ens(i) = prior_mean + (prior_mean - new_ens(i))
    else
       ! In one of the inner uniform boxes. Make this much more efficient search?
@@ -2000,105 +3974,131 @@ do i = 1, ens_size
 end do
 
 end subroutine update_ens_from_weights
-!---------------------------------------------------------------
 
-subroutine obs_updates_ens(ens_size, num_groups, ens, ens_loc, ens_kind, &
-   obs_prior, obs_inc, obs_prior_mean, obs_prior_var, obs_loc, obs_type, obs_time,    &
-   net_a, grp_size, grp_beg, grp_end, reg_factor_obs_index,         &
-   reg_factor_ens_index, final_factor, correl, correl_needed, inflate_only)
 
-integer,             intent(in)  :: ens_size
-integer,             intent(in)  :: num_groups
-real(r8),            intent(inout)  :: ens(ens_size)
-type(location_type), intent(in)  :: ens_loc
-integer,             intent(in)  :: ens_kind
-real(r8),            intent(in)  :: obs_prior(ens_size)
-real(r8),            intent(in)  :: obs_inc(ens_size)
-real(r8),            intent(in)  :: obs_prior_mean(num_groups)
-real(r8),            intent(in)  :: obs_prior_var(num_groups)
-type(location_type), intent(in)  :: obs_loc
-integer,             intent(in)  :: obs_type
-type(time_type),     intent(in)  :: obs_time
-real(r8),            intent(in)  :: net_a(num_groups)
-integer,             intent(in)  :: grp_size
-integer,             intent(in)  :: grp_beg(num_groups)
-integer,             intent(in)  :: grp_end(num_groups)
-integer,             intent(in)  :: reg_factor_obs_index
-integer(i8),         intent(in)  :: reg_factor_ens_index
-real(r8),            intent(inout) :: final_factor
-real(r8),            intent(out) :: correl(num_groups)
-logical,             intent(in)  :: correl_needed
-logical,             intent(in)  :: inflate_only
+!------------------------------------------------------------------------
 
-real(r8) :: reg_coef(num_groups), increment(ens_size)
-real(r8) :: reg_factor
-integer  :: group, grp_bot, grp_top
+function norm_cdf(x_in, mean, sd)
 
-! Loop through groups to update the state variable ensemble members
-do group = 1, num_groups
-   grp_bot = grp_beg(group); grp_top = grp_end(group)
-   ! Do update of state, correl only needed for varying ss inflate
-   if(correl_needed) then
-      call update_from_obs_inc(obs_prior(grp_bot:grp_top), obs_prior_mean(group), &
-         obs_prior_var(group), obs_inc(grp_bot:grp_top), ens(grp_bot:grp_top), grp_size, &
-         increment(grp_bot:grp_top), reg_coef(group), net_a(group), correl(group))
-   else
-      call update_from_obs_inc(obs_prior(grp_bot:grp_top), obs_prior_mean(group), &
-         obs_prior_var(group), obs_inc(grp_bot:grp_top), ens(grp_bot:grp_top), grp_size, &
-         increment(grp_bot:grp_top), reg_coef(group), net_a(group))
-   endif
-end do
+! Approximate cumulative distribution function for normal
+! with mean and sd evaluated at point x_in
+! Only works for x>= 0.
 
-if(num_groups > 1) then
-   reg_factor = comp_reg_factor(num_groups, reg_coef, obs_time, &
-      reg_factor_obs_index, reg_factor_ens_index)
-   final_factor = min(final_factor, reg_factor)
-endif
+real(r8)             :: norm_cdf
+real(r8), intent(in) :: x_in, mean, sd
 
-! Get the updated ensemble
-if(.not. inflate_only) ens = ens + final_factor * increment
+real(digits12) :: x, p, b1, b2, b3, b4, b5, t, density, nx
 
-end subroutine obs_updates_ens
+! Convert to a standard normal
+nx = (x_in - mean) / sd
 
-!-------------------------------------------------------------
+x = abs(nx)
 
-function cov_and_impact_factors(base_obs_loc, base_obs_type, state_loc, state_kind, &
-dist, cutoff_rev)
 
-! Computes the cov_factor and multiplies by obs_impact_factor if selected
+! Use formula from Abramowitz and Stegun to approximate
+p = 0.2316419_digits12
+b1 = 0.319381530_digits12
+b2 = -0.356563782_digits12
+b3 = 1.781477937_digits12
+b4 = -1.821255978_digits12
+b5 = 1.330274429_digits12
 
-real(r8) :: cov_and_impact_factors
-type(location_type), intent(in) :: base_obs_loc
-integer, intent(in) :: base_obs_type
-type(location_type), intent(in) :: state_loc
-integer, intent(in) :: state_kind
-real(r8), intent(in) :: dist
-real(r8), intent(in) :: cutoff_rev
+t = 1.0_digits12 / (1.0_digits12 + p * x)
 
-real(r8) :: impact_factor, cov_factor
+density = (1.0_digits12 / sqrt(2.0_digits12 * PI)) * exp(-x*x / 2.0_digits12)
 
-! Get external impact factors, cycle if impact of this ob on this state is zero
-if (adjust_obs_impact) then
-   ! Get the impact factor from the table if requested
-   impact_factor = obs_impact_table(base_obs_type, state_kind)
-   if(impact_factor <= 0.0_r8) then
-      ! Avoid the cost of computing cov_factor if impact is 0
-      cov_and_impact_factors = 0.0_r8
-      return
-   endif
+norm_cdf = 1.0_digits12 - density * &
+   ((((b5 * t + b4) * t + b3) * t + b2) * t + b1) * t
+
+if(nx < 0.0_digits12) norm_cdf = 1.0_digits12 - norm_cdf
+
+!write(*, *) 'cdf is ', norm_cdf
+
+end function norm_cdf
+
+
+!------------------------------------------------------------------------
+
+subroutine weighted_norm_inv(alpha, mean, sd, p, x)
+
+! Find the value of x for which the cdf of a N(mean, sd) multiplied times
+! alpha has value p.
+
+real(r8), intent(in)  :: alpha, mean, sd, p
+real(r8), intent(out) :: x
+
+real(r8) :: np
+
+! Can search in a standard normal, then multiply by sd at end and add mean
+! Divide p by alpha to get the right place for weighted normal
+np = p / alpha
+
+! Find spot in standard normal
+call norm_inv(np, x)
+
+! Add in the mean and normalize by sd
+x = mean + x * sd
+
+end subroutine weighted_norm_inv
+
+
+!------------------------------------------------------------------------
+
+subroutine norm_inv(p, x)
+
+real(r8), intent(in)  :: p
+real(r8), intent(out) :: x
+
+! normal inverse
+! translate from http://home.online.no/~pjacklam/notes/invnorm
+! a routine written by john herrero
+
+real(r8) :: p_low,p_high
+real(r8) :: a1,a2,a3,a4,a5,a6
+real(r8) :: b1,b2,b3,b4,b5
+real(r8) :: c1,c2,c3,c4,c5,c6
+real(r8) :: d1,d2,d3,d4
+real(r8) :: q,r
+a1 = -39.69683028665376_digits12
+a2 =  220.9460984245205_digits12
+a3 = -275.9285104469687_digits12
+a4 =  138.357751867269_digits12
+a5 = -30.66479806614716_digits12
+a6 =  2.506628277459239_digits12
+b1 = -54.4760987982241_digits12
+b2 =  161.5858368580409_digits12
+b3 = -155.6989798598866_digits12
+b4 =  66.80131188771972_digits12
+b5 = -13.28068155288572_digits12
+c1 = -0.007784894002430293_digits12
+c2 = -0.3223964580411365_digits12
+c3 = -2.400758277161838_digits12
+c4 = -2.549732539343734_digits12
+c5 =  4.374664141464968_digits12
+c6 =  2.938163982698783_digits12
+d1 =  0.007784695709041462_digits12
+d2 =  0.3224671290700398_digits12
+d3 =  2.445134137142996_digits12
+d4 =  3.754408661907416_digits12
+p_low  = 0.02425_digits12
+p_high = 1_digits12 - p_low
+! Split into an inner and two outer regions which have separate fits
+if(p < p_low) then
+   q = sqrt(-2.0_digits12 * log(p))
+   x = (((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / &
+      ((((d1*q + d2)*q + d3)*q + d4)*q + 1.0_digits12)
+else if(p > p_high) then
+   q = sqrt(-2.0_digits12 * log(1.0_digits12 - p))
+   x = -(((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / &
+      ((((d1*q + d2)*q + d3)*q + d4)*q + 1.0_digits12)
 else
-   impact_factor = 1.0_r8
+   q = p - 0.5_digits12
+   r = q*q
+   x = (((((a1*r + a2)*r + a3)*r + a4)*r + a5)*r + a6)*q / &
+      (((((b1*r + b2)*r + b3)*r + b4)*r + b5)*r + 1.0_digits12)
 endif
 
-! Compute the covariance factor
-cov_factor = comp_cov_factor(dist, cutoff_rev, &
-   base_obs_loc, base_obs_type, state_loc, state_kind)
-
-! Combine the impact_factor and the cov_factor
-cov_and_impact_factors = cov_factor * impact_factor
-
-end function cov_and_impact_factors
-
+end subroutine norm_inv
 
 !------------------------------------------------------------------------
 
@@ -2238,77 +4238,6 @@ call sum_across_tasks(local_count, count_close)
 end function count_close
 
 !----------------------------------------------------------------------
-! Revise the cutoff for this observation if adaptive localization is required
-! Output diagnostics for localization if requested
-
-subroutine adaptive_localization_and_diags(cutoff_orig, cutoff_rev, adaptive_localization_threshold, &
-   adaptive_cutoff_floor, num_close_obs, close_obs_ind, close_obs_dist, my_obs_type, &
-   base_obs_index, base_obs_loc, obs_def, out_unit)
-
-real(r8),            intent(in)  :: cutoff_orig
-real(r8),            intent(out) :: cutoff_rev
-integer,             intent(in)  :: adaptive_localization_threshold
-real(r8),            intent(in)  :: adaptive_cutoff_floor
-integer,             intent(in)  :: num_close_obs
-integer,             intent(in)  :: close_obs_ind(:)
-real(r8),            intent(in)  :: close_obs_dist(:)
-integer,             intent(in)  :: my_obs_type(:)
-integer,             intent(in)  :: base_obs_index
-type(location_type), intent(in)  :: base_obs_loc
-type(obs_def_type),  intent(in)  :: obs_def
-integer,             intent(in)  :: out_unit
-
-integer :: total_num_close_obs, rev_num_close_obs, secs, days
-type(time_type) :: this_obs_time
-character(len = 200) :: base_loc_text   ! longer than longest location formatting possible
-
-! Default is that cutoff is not revised
-cutoff_rev = cutoff_orig
-
-! For adaptive localization, need number of other obs close to the chosen observation
-if(adaptive_localization_threshold > 0) then
-   ! this does a cross-task sum, so all tasks must make this call.
-   total_num_close_obs = count_close(num_close_obs, close_obs_ind, my_obs_type, &
-                                     close_obs_dist, cutoff_rev*2.0_r8)
-
-   ! Want expected number of close observations to be reduced to some threshold;
-   ! accomplish this by cutting the size of the cutoff distance.
-   if(total_num_close_obs > adaptive_localization_threshold) then
-      cutoff_rev = revised_distance(cutoff_rev*2.0_r8, adaptive_localization_threshold, &
-                                    total_num_close_obs, base_obs_loc, &
-                                    adaptive_cutoff_floor*2.0_r8) / 2.0_r8
-   endif
-endif
-
-if ( output_localization_diagnostics ) then
-   ! Warning, this can be costly and generate large output
-   ! This is referred to as revised in case adaptive localization was done
-   rev_num_close_obs = count_close(num_close_obs, close_obs_ind, my_obs_type, &
-                                     close_obs_dist, cutoff_rev*2.0_r8)
-
-   ! Output diagnostic information about the number of close obs
-   if (my_task_id() == 0) then
-      this_obs_time = get_obs_def_time(obs_def)
-      call get_time(this_obs_time,secs,days)
-      call write_location(-1, base_obs_loc, charstring=base_loc_text)
-
-      ! If adaptive localization did something, output info about what it did
-      ! Probably would be more consistent to just output for all observations
-      if(adaptive_localization_threshold > 0 .and. &
-         total_num_close_obs > adaptive_localization_threshold) then
-         write(out_unit,'(i12,1x,i5,1x,i8,1x,A,2(f14.5,1x,i12))') base_obs_index, &
-            secs, days, trim(base_loc_text), cutoff_orig, total_num_close_obs, cutoff_rev, &
-            rev_num_close_obs
-      else
-         write(out_unit,'(i12,1x,i5,1x,i8,1x,A,f14.5,1x,i12)') base_obs_index, &
-            secs, days, trim(base_loc_text), cutoff_rev, rev_num_close_obs
-      endif
-   endif
-endif
-
-end subroutine adaptive_localization_and_diags
-
-!----------------------------------------------------------------------
 !> gets the location of of all my observations
 subroutine get_my_obs_loc(obs_ens_handle, obs_seq, keys, my_obs_loc, my_obs_kind, my_obs_type, my_obs_time)
 
@@ -2345,89 +4274,109 @@ my_obs_time = get_obs_def_time(obs_def)
 end subroutine get_my_obs_loc
 
 !--------------------------------------------------------------------
-!> Get close obs from cache if appropriate. Cache new get_close_obs info
-!> if requested.
+!> wrappers for timers
+!>
+!> t_space is where we store the time information 
+!> itemcount is the running count of how many times we've been called
+!> maxitems is a limit on the number of times we want this timer to print.
+!> do_sync overrides the default for whether we want to do a task sync
+!> or not.  right now this code defaults to yes, sync before getting
+!> the time.  for very large processor counts this increases overhead.
 
-subroutine get_close_obs_cached(gc_obs, base_obs_loc, base_obs_type, &
-   my_obs_loc, my_obs_kind, my_obs_type, num_close_obs, close_obs_ind, close_obs_dist,  &
-   ens_handle, last_base_obs_loc, last_num_close_obs, num_close_obs_cached,               &
-   num_close_obs_calls_made)
+subroutine start_timer(t_space, itemcount, maxitems, do_sync)
+ real(digits12), intent(out) :: t_space
+ integer(i8),    intent(inout), optional :: itemcount
+ integer(i8),    intent(in),    optional :: maxitems
+ logical,        intent(in),    optional :: do_sync
 
-type(get_close_type),          intent(in)  :: gc_obs
-type(location_type),           intent(inout) :: base_obs_loc, my_obs_loc(:)
-integer,                       intent(in)  :: base_obs_type, my_obs_kind(:), my_obs_type(:)
-integer,                       intent(out) :: num_close_obs
-integer,                       intent(inout) :: close_obs_ind(:)
-real(r8),                      intent(inout) :: close_obs_dist(:)
-type(ensemble_type),           intent(in)  :: ens_handle
-type(location_type), intent(inout) :: last_base_obs_loc
-integer, intent(inout) :: last_num_close_obs
-integer, intent(inout) :: num_close_obs_cached, num_close_obs_calls_made
+logical :: sync_me
 
-! This logic could be arranged to make code less redundant
-if (.not. close_obs_caching) then
-   call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
-                      my_obs_loc, my_obs_kind, my_obs_type, &
-                      num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
-else
-   if (base_obs_loc == last_base_obs_loc) then
-      num_close_obs     = last_num_close_obs
-      num_close_obs_cached = num_close_obs_cached + 1
-   else
-      call get_close_obs(gc_obs, base_obs_loc, base_obs_type, &
-                         my_obs_loc, my_obs_kind, my_obs_type, &
-                         num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+if (present(itemcount) .and. present(maxitems)) then
+  itemcount = itemcount + 1
+  if (itemcount > maxitems) then
+     ! if called enough, this can roll over the integer limit.  
+     ! set itemcount to maxitems+1 here to avoid this.
+     ! also, go ahead and set the time because there is
+     ! an option to print large time values even if over the
+     ! number of calls limit in read_timer()
 
-      last_base_obs_loc      = base_obs_loc
-      last_num_close_obs     = num_close_obs
-      num_close_obs_calls_made = num_close_obs_calls_made +1
-   endif
+     itemcount = maxitems + 1
+     call start_mpi_timer(t_space)
+     return
+  endif
 endif
 
-end subroutine get_close_obs_cached
+sync_me = .true.
+if (present(do_sync)) sync_me = do_sync
+
+if (sync_me) call task_sync()
+call start_mpi_timer(t_space)
+
+end subroutine start_timer
 
 !--------------------------------------------------------------------
-!> Get close state from cache if appropriate. Cache new get_close_state info
-!> if requested.
+!>
+!> t_space is where we store the time information 
+!> label is the string to print out with the time.  limited to ~60 chars.
+!> itemcount is the running count of how many times we've been called
+!> maxitems is a limit on the number of times we want this timer to print.
+!> do_sync overrides the default for whether we want to do a task sync
+!> or not.  right now this code defaults to yes, sync before getting
+!> the time.  for very large processor counts this increases overhead.
+!> elapsed is an optional return of the value instead of only printing here
 
-subroutine get_close_state_cached(gc_state, base_obs_loc, base_obs_type, &
-   my_state_loc, my_state_kind, my_state_indx, num_close_states, close_state_ind, close_state_dist,  &
-   ens_handle, last_base_states_loc, last_num_close_states, num_close_states_cached,               &
-   num_close_states_calls_made)
+subroutine read_timer(t_space, label, itemcount, maxitems, do_sync, elapsed)
+ real(digits12),   intent(in) :: t_space
+ character(len=*), intent(in) :: label
+ integer(i8),      intent(inout), optional :: itemcount
+ integer(i8),      intent(in),    optional :: maxitems
+ logical,          intent(in),    optional :: do_sync
+ real(digits12),   intent(out),   optional :: elapsed
 
-type(get_close_type),          intent(in)    :: gc_state
-type(location_type),           intent(inout) :: base_obs_loc, my_state_loc(:)
-integer,                       intent(in)    :: base_obs_type, my_state_kind(:)
-integer(i8),                   intent(in)    :: my_state_indx(:)
-integer,                       intent(out)   :: num_close_states
-integer,                       intent(inout) :: close_state_ind(:)
-real(r8),                      intent(inout) :: close_state_dist(:)
-type(ensemble_type),           intent(in)    :: ens_handle
-type(location_type), intent(inout) :: last_base_states_loc
-integer, intent(inout) :: last_num_close_states
-integer, intent(inout) :: num_close_states_cached, num_close_states_calls_made
+real(digits12) :: interval
+logical :: sync_me
+character(len=132) :: buffer
 
-! This logic could be arranged to make code less redundant
-if (.not. close_obs_caching) then
-   call get_close_state(gc_state, base_obs_loc, base_obs_type, &
-                      my_state_loc, my_state_kind, my_state_indx, &
-                      num_close_states, close_state_ind, close_state_dist, ens_handle)
-else
-   if (base_obs_loc == last_base_states_loc) then
-      num_close_states     = last_num_close_states
-      num_close_states_cached = num_close_states_cached + 1
-   else
-      call get_close_state(gc_state, base_obs_loc, base_obs_type, &
-                         my_state_loc, my_state_kind, my_state_indx, &
-                         num_close_states, close_state_ind, close_state_dist, ens_handle)
+! if interval time (in seconds) is > this, go ahead and
+! print even if item count is over limit.
+integer(i8), parameter :: T_ALWAYS_PRINT = 1.0_r8
 
-      last_base_states_loc      = base_obs_loc
-      last_num_close_states     = num_close_states
-      num_close_states_calls_made = num_close_states_calls_made +1
-   endif
+! get the time first and then figure out what we're doing
+
+interval = read_mpi_timer(t_space)
+
+sync_me = .true.
+if (present(do_sync)) sync_me = do_sync
+
+! if there's a limit on number of prints don't allow sync 
+! because if we return early we could hang everyone else.
+if (present(maxitems)) sync_me = .false.
+
+! print out large values no matter what
+! (large is defined above locally in this routine)
+if (present(itemcount) .and. present(maxitems)) then
+  if (interval < T_ALWAYS_PRINT .and. itemcount > maxitems) return
 endif
 
-end subroutine get_close_state_cached
+! if syncing, wait and read the timer again
+if (sync_me) then
+   call task_sync()
+   interval = read_mpi_timer(t_space)
+endif
+
+if (sync_me) then
+   if (my_task_id() == 0) then
+      write(buffer,'(A75,F15.8)') "timer: "//trim(label)//" time ", interval
+      write(*,*) buffer
+   endif
+else
+   write(buffer,'(A75,F15.8,A6,I7)') "timer: "//trim(label)//" time ", interval, " rank ", my_task_id()
+   write(*,*) buffer
+endif
+
+if (present(elapsed)) elapsed = interval
+
+end subroutine read_timer
 
 !--------------------------------------------------------------------
 !> log what the user has selected via the namelist choices
@@ -2438,6 +4387,31 @@ integer, intent(in) :: num_special_cutoff
 logical, intent(in) :: cache_override
 
 integer :: i
+
+select case (filter_kind)
+ case (1)
+   msgstring = 'Ensemble Adjustment Kalman Filter (EAKF)'
+ case (2)
+   msgstring = 'Ensemble Kalman Filter (ENKF)'
+ case (3)
+   msgstring = 'Kernel filter'
+ case (4)
+   msgstring = 'observation space particle filter'
+ case (5)
+   msgstring = 'random draw from posterior'
+ case (6)
+   msgstring = 'deterministic draw from posterior with fixed kurtosis'
+ case (7)
+   msgstring = 'Boxcar'
+ case (8)
+   msgstring = 'Rank Histogram Filter'
+ case (9) 
+   msgstring = 'Local Particle Filter (Poterjoy)'
+ case default
+   call error_handler(E_ERR, 'assim_tools_init:', 'illegal filter_kind value, valid values are 1-9', &
+                      source)
+end select
+call error_handler(E_MSG, 'assim_tools_init:', 'Selected filter type is '//trim(msgstring))
 
 if (adjust_obs_impact) then
    call allocate_impact_table(obs_impact_table)
@@ -2454,7 +4428,7 @@ call error_handler(E_MSG,'assim_tools_init:', msgstring, text2=msgstring2, text3
 if (has_special_cutoffs) then
    call error_handler(E_MSG, '', '')
    call error_handler(E_MSG,'assim_tools_init:','Observations with special localization treatment:')
-   call error_handler(E_MSG,'assim_tools_init:','(type name, specified cutoff distance, effective localization radius)')
+   call error_handler(E_MSG,'assim_tools_init:','(type name, specified cutoff distance, effective localization radius)') 
 
    do i = 1, num_special_cutoff
       write(msgstring, '(A32,F18.6,F18.6)') special_localization_obs_types(i), &
@@ -2614,4 +4588,3 @@ end subroutine test_close_obs_dist
 !========================================================================
 
 end module assim_tools_mod
-
